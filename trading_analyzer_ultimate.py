@@ -8,9 +8,10 @@ Combines ALL advanced features:
 - Hierarchical Pattern Tracking (parent/child relationships)
 - Sequence Detection (liquidity sweep → regain → reversal)
 - Minimum Separation Warnings
+- Session Visualization (auto-generated chart for cross-reference)
 
 SETUP:
-1. Install dependencies: pip install databento pandas numpy scikit-learn pytz
+1. Install dependencies: pip install databento pandas numpy scikit-learn pytz matplotlib
 2. Set environment variable: export DATABENTO_API_KEY="your_api_key_here"
 3. Run: python trading_analyzer_ultimate.py
 
@@ -41,6 +42,19 @@ except ImportError:
     SKLEARN_AVAILABLE = False
     print("[WARN] scikit-learn not installed. ML features disabled.")
     print("       Install with: pip install scikit-learn")
+
+# --- VISUALIZATION IMPORTS ---
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from matplotlib.patches import Rectangle
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    print("[WARN] matplotlib not installed. Visualization disabled.")
+    print("       Install with: pip install matplotlib")
 
 # --- CONFIGURATION ---
 # Security: API key from environment variable
@@ -788,7 +802,213 @@ class PatternAnalysisState:
         return None
 
 
-# --- 12. INTERACTIVE LOOP (ULTIMATE VERSION) ---
+# --- 12. SESSION VISUALIZATION ---
+def generate_session_chart(df: pd.DataFrame, analysis_state: PatternAnalysisState,
+                           date_obj: datetime.date, sequences: List[Dict]):
+    """
+    Generate comprehensive visualization of the trading session.
+
+    Shows:
+    - Price action (1-minute candles)
+    - Analyzed pattern markers with labels
+    - Time windows used (shaded rectangles)
+    - Hierarchical relationships (parent/child connections)
+    - Sequences (connecting lines)
+    - Color-coded by pattern type
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        print("[WARN] matplotlib not installed. Skipping visualization.")
+        return None
+
+    if not analysis_state.analyzed_patterns:
+        print("[INFO] No patterns analyzed. Skipping visualization.")
+        return None
+
+    print("\n[VISUALIZATION] Generating session chart...")
+
+    # Create 1-minute candles for visualization
+    df_copy = df.copy()
+    df_copy['minute'] = df_copy.index.floor('1min')
+    candle_data = []
+
+    for timestamp, group in df_copy.groupby('minute'):
+        candle_data.append({
+            'time': timestamp,
+            'open': group['price'].iloc[0],
+            'high': group['price'].max(),
+            'low': group['price'].min(),
+            'close': group['price'].iloc[-1],
+            'volume': group['size'].sum()
+        })
+
+    candles_df = pd.DataFrame(candle_data)
+
+    # Pattern color mapping
+    pattern_colors = {
+        'REVERSAL (TOP)': '#FF4444',  # Red
+        'REVERSAL (BOTTOM)': '#44FF44',  # Green
+        'FALSE REVERSAL': '#FFA500',  # Orange
+        'CONTINUATION': '#4444FF',  # Blue
+        'PULLBACK CONTINUATION': '#00CED1',  # Dark Cyan
+        'CONSOLIDATION': '#DAA520',  # Goldenrod
+        'V-SHAPE': '#FF00FF',  # Magenta
+        'UNCERTAIN': '#808080'  # Gray
+    }
+
+    # Create figure with 2 subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12),
+                                    height_ratios=[3, 1],
+                                    gridspec_kw={'hspace': 0.1})
+
+    # --- SUBPLOT 1: PRICE CHART ---
+
+    # Plot candlestick-style line chart
+    ax1.plot(candles_df['time'], candles_df['close'],
+             color='#333333', linewidth=1, alpha=0.6, label='Price')
+
+    # Fill between high and low for candle bodies
+    for idx, row in candles_df.iterrows():
+        color = '#00AA00' if row['close'] >= row['open'] else '#AA0000'
+        ax1.plot([row['time'], row['time']], [row['low'], row['high']],
+                color=color, linewidth=0.5, alpha=0.3)
+
+    # Plot analyzed patterns
+    for pattern in analysis_state.analyzed_patterns:
+        label = pattern['label']
+        timestamp = pattern['timestamp']
+        time_range = pattern['range']
+        color = pattern_colors.get(label, '#808080')
+
+        # Get price at this time
+        closest_candle = candles_df.iloc[(candles_df['time'] - timestamp).abs().argsort()[:1]]
+        if not closest_candle.empty:
+            price = closest_candle['close'].values[0]
+
+            # Plot time window as shaded rectangle
+            window_height = candles_df['high'].max() - candles_df['low'].min()
+            rect = Rectangle((mdates.date2num(time_range[0]), candles_df['low'].min()),
+                           mdates.date2num(time_range[1]) - mdates.date2num(time_range[0]),
+                           window_height,
+                           facecolor=color, alpha=0.1, edgecolor=color, linewidth=0.5)
+            ax1.add_patch(rect)
+
+            # Plot marker at center
+            marker_style = 'o' if pattern['parent'] is None else '^'  # Circle for parent, triangle for child
+            marker_size = 200 if pattern['parent'] is None else 100
+            ax1.scatter(timestamp, price, s=marker_size, c=color,
+                       marker=marker_style, edgecolors='black', linewidths=2,
+                       zorder=5, alpha=0.9)
+
+            # Add label text
+            label_text = label
+            if pattern['sequence_position'] > 0:
+                label_text += f" (seq{pattern['sequence_position']})"
+            if pattern['parent']:
+                label_text += " ↑"  # Up arrow for child
+
+            ax1.annotate(label_text,
+                        xy=(timestamp, price),
+                        xytext=(0, 20 if pattern['parent'] is None else -30),
+                        textcoords='offset points',
+                        fontsize=8,
+                        fontweight='bold',
+                        color=color,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                                 edgecolor=color, alpha=0.8),
+                        ha='center',
+                        zorder=6)
+
+    # Draw sequence connections
+    if sequences:
+        for seq in sequences:
+            seq_patterns = [p for p in analysis_state.analyzed_patterns
+                          if p['time_str'] in seq['patterns']]
+            if len(seq_patterns) >= 2:
+                for i in range(len(seq_patterns) - 1):
+                    p1 = seq_patterns[i]
+                    p2 = seq_patterns[i + 1]
+
+                    # Get prices
+                    c1 = candles_df.iloc[(candles_df['time'] - p1['timestamp']).abs().argsort()[:1]]
+                    c2 = candles_df.iloc[(candles_df['time'] - p2['timestamp']).abs().argsort()[:1]]
+
+                    if not c1.empty and not c2.empty:
+                        price1 = c1['close'].values[0]
+                        price2 = c2['close'].values[0]
+
+                        # Draw dashed line connecting sequence
+                        ax1.plot([p1['timestamp'], p2['timestamp']],
+                                [price1, price2],
+                                linestyle='--', linewidth=2, color='purple',
+                                alpha=0.6, zorder=4)
+
+    # Draw hierarchical connections (parent to children)
+    for pattern in analysis_state.analyzed_patterns:
+        if pattern['children']:
+            parent_candle = candles_df.iloc[(candles_df['time'] - pattern['timestamp']).abs().argsort()[:1]]
+            if not parent_candle.empty:
+                parent_price = parent_candle['close'].values[0]
+
+                for child_time_str in pattern['children']:
+                    child_pattern = next((p for p in analysis_state.analyzed_patterns
+                                        if p['time_str'] == child_time_str), None)
+                    if child_pattern:
+                        child_candle = candles_df.iloc[(candles_df['time'] - child_pattern['timestamp']).abs().argsort()[:1]]
+                        if not child_candle.empty:
+                            child_price = child_candle['close'].values[0]
+
+                            # Draw dotted line showing hierarchy
+                            ax1.plot([pattern['timestamp'], child_pattern['timestamp']],
+                                    [parent_price, child_price],
+                                    linestyle=':', linewidth=1.5, color='gray',
+                                    alpha=0.4, zorder=3)
+
+    # Format price chart
+    ax1.set_ylabel('Price', fontsize=12, fontweight='bold')
+    ax1.set_title(f'Trading Session Analysis - {date_obj.strftime("%Y-%m-%d")}\n'
+                  f'{len(analysis_state.analyzed_patterns)} Patterns | '
+                  f'{len(sequences)} Sequences',
+                  fontsize=14, fontweight='bold', pad=20)
+    ax1.grid(True, alpha=0.3, linestyle='--')
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax1.tick_params(labelbottom=False)  # Hide x-labels on top chart
+
+    # --- SUBPLOT 2: VOLUME ---
+    ax2.bar(candles_df['time'], candles_df['volume'],
+           width=1/1440, color='steelblue', alpha=0.6)
+    ax2.set_ylabel('Volume', fontsize=10)
+    ax2.set_xlabel('Time', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Create legend
+    legend_elements = [plt.scatter([], [], s=100, c=color, marker='o',
+                                  edgecolors='black', linewidths=2, label=label)
+                      for label, color in pattern_colors.items()]
+    legend_elements.append(plt.Line2D([0], [0], linestyle='--', linewidth=2,
+                                     color='purple', label='Sequence'))
+    legend_elements.append(plt.Line2D([0], [0], linestyle=':', linewidth=1.5,
+                                     color='gray', label='Hierarchy'))
+    ax1.legend(handles=legend_elements, loc='upper left', fontsize=9,
+              framealpha=0.9, ncol=2)
+
+    # Tight layout
+    plt.tight_layout()
+
+    # Save figure
+    filename = f"session_chart_{date_obj.strftime('%Y%m%d')}_{datetime.now().strftime('%H%M%S')}.png"
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"[VISUALIZATION] Chart saved: {filename}")
+    print(f"                Size: {os.path.getsize(filename) / 1024:.1f} KB")
+    print(f"                Cross-reference this with your TradingView chart!")
+
+    return filename
+
+
+# --- 13. INTERACTIVE LOOP (ULTIMATE VERSION) ---
 def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                              date_obj: datetime.date, tz: pytz.timezone,
                              ai_brain: TradeClassifier,
@@ -1043,6 +1263,10 @@ def main():
     print(f"Analyzed {len(analysis_state.analyzed_patterns)} patterns")
     sequences = analysis_state.detect_sequences()
     print(f"Detected {len(sequences)} pattern sequences")
+
+    # Generate visualization
+    if analysis_state.analyzed_patterns:
+        generate_session_chart(df, analysis_state, d_obj, sequences)
 
     print("\n[INFO] Session complete. Goodbye!")
 
