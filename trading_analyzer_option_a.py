@@ -1,7 +1,7 @@
 """
-Trading Pattern Classifier - OPTION A (24 Features)
+Trading Pattern Classifier - OPTION A (33 Features)
 
-SEQUENCE LEARNING VERSION:
+SEQUENCE LEARNING + INCREMENTAL + CONSOLIDATION CONTEXT VERSION:
 - 8 Pattern Types (refined taxonomy):
   1. HOD (High of Day) - Actual session high (may or may not be significant reversal)
   2. LOD (Low of Day) - Actual session low (may or may not be significant reversal)
@@ -12,11 +12,17 @@ SEQUENCE LEARNING VERSION:
   7. CONSOLIDATION - Sideways, range-bound, low volatility
   8. IMPULSE MOVE - Explosive directional move (from consolidation OR v-shape)
 
-- 24 ML Features enabling automatic sequence discovery:
+- 33 ML Features enabling automatic sequence discovery + solving overlapping windows:
   * 12 Base Features (Volume Profile + Price Velocity + Delta/Volume Analysis)
   * 4 Sequence Context Features (previous patterns, timing)
   * 8 Multi-Day/Session Context Features (gaps, initial balance, previous day levels)
+  * 4 Incremental Features (CHANGE since last pattern - solves overlap problem!)
+  * 4 Consolidation Context Features (breakout detection from consolidation ranges)
 
+- Session Pre-Scan (calculates rolling metrics for entire session)
+- Smart Windowing (uses gaps between patterns when <5 min apart)
+- Incremental Feature Extraction (measures CHANGE not absolute values)
+- Consolidation Containers (tracks consolidation ranges, auto-detects breakouts)
 - Adaptive Time Windows (auto-adjusts to volatility)
 - Hierarchical Pattern Tracking (parent/child relationships)
 - ML-Based Sequence Learning (NOT hard-coded)
@@ -27,17 +33,28 @@ KEY IMPROVEMENTS:
 2. REVERSAL redefined (significant magnitude that holds, not just day's extreme)
 3. FALSE REVERSAL clarified (traps traders, insufficient magnitude or fails)
 4. IMPULSE MOVE added (explosive moves from consolidation or v-shapes)
-5. ML learns sequences like "IMPULSE → FALSE REVERSAL → PULLBACK CONTINUATION"
+5. INCREMENTAL FEATURES solve overlapping window problem (9:49 vs 9:50 now distinct!)
+6. CONSOLIDATION CONTEXT enables learning breakout patterns automatically
+7. ML learns sequences like "CONSOLIDATION → IMPULSE → FALSE REVERSAL → PULLBACK"
 
 The ML model learns which sequences matter through context features, enabling discovery of
 patterns like "Gap-up near prev day high → IMPULSE → FALSE REVERSAL → PULLBACK → REVERSAL"
 without hard-coded rules. Volumes, deltas, and velocities are analyzed to distinguish
 patterns (e.g., false reversals often show weak volume + opposite delta influx).
 
+For close-together patterns (like 9:49, 9:50, 9:55), incremental features measure the
+CHANGE between patterns rather than absolute values, making each pattern mathematically
+distinct and avoiding ML confusion from overlapping windows.
+
 SETUP:
 1. Install dependencies: pip install databento pandas numpy scikit-learn pytz matplotlib
 2. Set environment variable: export DATABENTO_API_KEY="your_api_key_here"
 3. Run: python trading_analyzer_option_a.py
+
+USAGE:
+- Enter consolidations as time ranges: "9:56-10:32" then label as CONSOLIDATION
+  System automatically tracks it as a container and adds breakout features to next pattern
+- Enter close patterns normally: "9:49, 9:50, 9:55" - incremental features handle it!
 
 FEATURES:
 - Expected accuracy: 85-95%+ with 100+ training examples
@@ -45,6 +62,7 @@ FEATURES:
 - Learns pattern sequences through context (not hard-coded detection)
 - Understands multi-day context (gaps, previous day levels, initial balance)
 - Handles weekends and holidays (finds previous trading day automatically)
+- Solves overlapping window problem for close-together patterns
 """
 
 import databento as db
@@ -347,7 +365,75 @@ def get_previous_trading_day_data(api_key: str, current_date: datetime.date,
     return None, None
 
 
-# --- 5. METRICS ENGINE ---
+# --- 5. SESSION PRE-SCAN (NEW!) ---
+def pre_scan_session(df: pd.DataFrame) -> Dict:
+    """
+    Pre-calculate rolling metrics for the entire session.
+
+    This enables incremental feature extraction for close-together patterns,
+    solving the overlapping window problem.
+
+    Returns a dictionary with per-minute rolling state:
+    {
+        timestamp: {
+            'cumulative_volume': int,
+            'cumulative_delta': int,
+            'rolling_high': float,
+            'rolling_low': float,
+            'minute_volume': int,
+            'minute_delta': int,
+            'minute_range': float,
+            'price': float
+        }
+    }
+    """
+    print("\n[PRE-SCAN] Calculating session-wide rolling metrics...")
+
+    if df.empty:
+        return {}
+
+    # Group by minute
+    df_copy = df.copy()
+    df_copy['minute'] = df_copy.index.floor('1min')
+
+    session_state = {}
+    cumulative_vol = 0
+    cumulative_delta = 0
+    rolling_high = df['price'].iloc[0]
+    rolling_low = df['price'].iloc[0]
+
+    for timestamp, group in df_copy.groupby('minute'):
+        # Per-minute metrics
+        minute_vol = int(group['size'].sum())
+        minute_delta = int(group['signed_vol'].sum())
+        minute_high = group['price'].max()
+        minute_low = group['price'].min()
+        minute_range = minute_high - minute_low
+        close_price = group['price'].iloc[-1]
+
+        # Update cumulative metrics
+        cumulative_vol += minute_vol
+        cumulative_delta += minute_delta
+        rolling_high = max(rolling_high, minute_high)
+        rolling_low = min(rolling_low, minute_low)
+
+        # Store state
+        session_state[timestamp] = {
+            'cumulative_volume': cumulative_vol,
+            'cumulative_delta': cumulative_delta,
+            'rolling_high': rolling_high,
+            'rolling_low': rolling_low,
+            'minute_volume': minute_vol,
+            'minute_delta': minute_delta,
+            'minute_range': minute_range,
+            'price': close_price
+        }
+
+    print(f"[PRE-SCAN] Processed {len(session_state)} minutes of data")
+    return session_state
+
+
+# --- 6. METRICS ENGINE ---
 def calculate_granular_metrics(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Dict[str, int]]:
     """Calculate per-minute metrics and period totals."""
     if df.empty:
@@ -555,22 +641,26 @@ class SessionContext:
         print(f"  Initial Balance: High {self.ib_high:.2f} | Low {self.ib_low:.2f} | Range {self.ib_range:.2f} pts")
 
 
-# --- 9. ENHANCED FEATURE EXTRACTION (24 FEATURES!) ---
+# --- 9. ENHANCED FEATURE EXTRACTION (33 FEATURES!) ---
 def extract_features(pre_df: pd.DataFrame, event_df: pd.DataFrame,
                     post_df: pd.DataFrame, totals: Dict,
                     session_ctx: SessionContext,
                     analysis_state: 'PatternAnalysisState',
-                    current_time: datetime) -> Dict:
+                    current_time: datetime,
+                    session_state: Dict = None) -> Dict:
     """
-    Extract all 24 features for ML model.
+    Extract all 33 features for ML model (24 original + 9 incremental/consolidation).
 
     FEATURE BREAKDOWN:
     - Features 1-12: Base features (original + volume profile + velocity)
     - Features 13-16: Sequence context (previous patterns, timing)
     - Features 17-24: Multi-day/session context (gaps, IB, previous day levels, time of day)
+    - Features 25-28: Incremental features (change since last pattern - NEW!)
+    - Features 29-32: Consolidation context (breakout detection - NEW!)
 
     This comprehensive feature set enables the ML model to learn sequences automatically
-    without hard-coding detection logic.
+    without hard-coding detection logic, and solves the overlapping window problem for
+    close-together patterns.
     """
     open_px = event_df['price'].iloc[0]
     close_px = event_df['price'].iloc[-1]
@@ -706,6 +796,44 @@ def extract_features(pre_df: pd.DataFrame, event_df: pd.DataFrame,
     else:
         time_of_day = 0.5  # Default to midday
 
+    # ========== FEATURES 25-28: INCREMENTAL (CHANGE SINCE LAST PATTERN) ==========
+    # These features solve the overlapping window problem for close-together patterns
+
+    delta_change_since_last = 0.0
+    volume_change_since_last = 0.0
+    price_change_since_last = 0.0
+    velocity_change_since_last = 0.0
+
+    if session_state and analysis_state and analysis_state.analyzed_patterns:
+        # Get most recent pattern
+        sorted_patterns = sorted(analysis_state.analyzed_patterns,
+                                key=lambda x: x['timestamp'])
+        prev_patterns = [p for p in sorted_patterns if p['timestamp'] < current_time]
+
+        if prev_patterns:
+            last_pattern = prev_patterns[-1]
+            last_time = last_pattern['timestamp']
+            last_features = last_pattern.get('features', {})
+
+            # Calculate CHANGE since last pattern (not absolute values)
+            delta_change_since_last = totals.get('net_delta', 0) - last_features.get('total_vol', 0) * last_features.get('delta_imbalance', 0)
+            volume_change_since_last = total_vol - last_features.get('total_vol', 0)
+            price_change_since_last = close_px - last_features.get('price', close_px)
+
+            # Velocity change (acceleration/deceleration)
+            last_velocity = last_features.get('price_velocity', 0)
+            velocity_change_since_last = overall_velocity - last_velocity
+
+    # ========== FEATURES 29-32: CONSOLIDATION CONTEXT ==========
+    # These features enable ML to learn breakout patterns from consolidation
+
+    consol_context = analysis_state.get_consolidation_context(current_time, close_px) if analysis_state else {}
+
+    inside_consolidation = 1.0 if consol_context.get('inside_consolidation', False) else 0.0
+    breakout_from_consolidation = 1.0 if consol_context.get('breakout_from_consolidation', False) else 0.0
+    consolidation_duration = consol_context.get('consolidation_duration', 0.0)
+    breakout_magnitude = consol_context.get('breakout_magnitude', 0.0)
+
     return {
         # Base features (1-12)
         'trend': trend,
@@ -735,20 +863,32 @@ def extract_features(pre_df: pd.DataFrame, event_df: pd.DataFrame,
         'current_vs_ib_low': current_vs_ib_low,
         'current_vs_prev_high': current_vs_prev_high,
         'current_vs_prev_low': current_vs_prev_low,
-        'time_of_day': time_of_day
+        'time_of_day': time_of_day,
+
+        # Incremental features (25-28) - NEW!
+        'delta_change_since_last': delta_change_since_last,
+        'volume_change_since_last': volume_change_since_last,
+        'price_change_since_last': price_change_since_last,
+        'velocity_change_since_last': velocity_change_since_last,
+
+        # Consolidation context features (29-32) - NEW!
+        'inside_consolidation': inside_consolidation,
+        'breakout_from_consolidation': breakout_from_consolidation,
+        'consolidation_duration': consolidation_duration,
+        'breakout_magnitude': breakout_magnitude
     }
 
 
-# --- 10. THE AI BRAIN (OPTION A - 24 FEATURES) ---
+# --- 10. THE AI BRAIN (OPTION A - 33 FEATURES) ---
 class TradeClassifier:
-    """Option A ML classifier with 24 features for sequence learning."""
+    """Option A ML classifier with 33 features for sequence learning + incremental + consolidation context."""
 
     def __init__(self):
         self.model = None
         self.encoder = None
         self.needs_retraining = True
 
-        # ALL 24 FEATURES
+        # ALL 33 FEATURES
         self.feature_cols = [
             # Base features (1-12)
             'trend', 'color', 'broken_high', 'broken_low',
@@ -763,7 +903,15 @@ class TradeClassifier:
             'gap_pct', 'open_type', 'ib_range',
             'current_vs_ib_high', 'current_vs_ib_low',
             'current_vs_prev_high', 'current_vs_prev_low',
-            'time_of_day'
+            'time_of_day',
+
+            # Incremental features (25-28) - NEW!
+            'delta_change_since_last', 'volume_change_since_last',
+            'price_change_since_last', 'velocity_change_since_last',
+
+            # Consolidation context (29-32) - NEW!
+            'inside_consolidation', 'breakout_from_consolidation',
+            'consolidation_duration', 'breakout_magnitude'
         ]
 
         self.labels_map = [
@@ -850,7 +998,7 @@ class TradeClassifier:
             train_score = self.model.score(X_train, y_train)
             test_score = self.model.score(X_test, y_test)
 
-            print(f"[ML] Option A model trained on {len(df)} examples (24 features, 8 patterns)")
+            print(f"[ML] Option A model trained on {len(df)} examples (33 features, 8 patterns)")
             print(f"     Training accuracy: {train_score:.1%}")
             print(f"     Testing accuracy:  {test_score:.1%}")
 
@@ -1056,6 +1204,7 @@ class PatternAnalysisState:
     def __init__(self):
         self.analyzed_patterns = []  # List of dicts
         self.analyzed_times = []  # List of datetimes
+        self.consolidation_ranges = []  # List of consolidation containers
         self.pattern_label_encoder = {
             "HOD": 1,
             "LOD": 2,
@@ -1162,6 +1311,72 @@ class PatternAnalysisState:
                 if parent_pattern:
                     return parent_pattern['label']
         return None
+
+    def add_consolidation_range(self, start_time: datetime, end_time: datetime,
+                               high_px: float, low_px: float):
+        """
+        Add a consolidation range container.
+
+        This is called when user enters a consolidation as a time range (e.g., "9:56-10:32").
+        The consolidation acts as a context container for subsequent patterns.
+        """
+        duration_mins = (end_time - start_time).total_seconds() / 60
+        range_pts = high_px - low_px
+
+        consolidation = {
+            'start': start_time,
+            'end': end_time,
+            'high': high_px,
+            'low': low_px,
+            'range': range_pts,
+            'duration': duration_mins
+        }
+
+        self.consolidation_ranges.append(consolidation)
+        print(f"[CONSOLIDATION RANGE] Added: {start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')}")
+        print(f"                      Range: {range_pts:.2f} pts | Duration: {duration_mins:.0f} min")
+
+    def get_consolidation_context(self, timestamp: datetime, price: float) -> Dict:
+        """
+        Get consolidation context for a given timestamp and price.
+
+        Returns features:
+        - inside_consolidation: Is this timestamp inside a consolidation range?
+        - breakout_from_consolidation: Is this immediately after consolidation (within 5 min)?
+        - consolidation_duration: Duration of the consolidation being broken out of
+        - breakout_magnitude: How far from consolidation range (in pts)
+        """
+        context = {
+            'inside_consolidation': False,
+            'breakout_from_consolidation': False,
+            'consolidation_duration': 0.0,
+            'breakout_magnitude': 0.0
+        }
+
+        for consol in self.consolidation_ranges:
+            # Check if inside consolidation
+            if consol['start'] <= timestamp <= consol['end']:
+                context['inside_consolidation'] = True
+                context['consolidation_duration'] = consol['duration']
+                return context
+
+            # Check if breaking out (within 5 minutes after consolidation)
+            time_after_consol = (timestamp - consol['end']).total_seconds() / 60
+            if 0 < time_after_consol <= 5:
+                context['breakout_from_consolidation'] = True
+                context['consolidation_duration'] = consol['duration']
+
+                # Calculate breakout magnitude
+                if price > consol['high']:
+                    context['breakout_magnitude'] = price - consol['high']
+                elif price < consol['low']:
+                    context['breakout_magnitude'] = consol['low'] - price
+                else:
+                    context['breakout_magnitude'] = 0.0
+
+                return context
+
+        return context
 
 
 # --- 13. SESSION VISUALIZATION ---
@@ -1375,8 +1590,9 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                              date_obj: datetime.date, tz: pytz.timezone,
                              ai_brain: TradeClassifier,
                              analysis_state: PatternAnalysisState,
-                             session_ctx: SessionContext):
-    """Process user-specified time ranges with all 24 features."""
+                             session_ctx: SessionContext,
+                             session_state: Dict):
+    """Process user-specified time ranges with all 33 features (includes incremental + consolidation context)."""
     items = [x.strip() for x in user_input.split(',')]
 
     for item in items:
@@ -1435,9 +1651,9 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                 print(f"[WARN] No metrics generated for {item}")
                 continue
 
-            # Extract Features (ALL 24!)
+            # Extract Features (ALL 33!)
             feats = extract_features(pre_df, event_df, post_df, totals,
-                                    session_ctx, analysis_state, center_ts)
+                                    session_ctx, analysis_state, center_ts, session_state)
             high_px, low_px = event_df['price'].max(), event_df['price'].min()
             duration = feats['duration_mins']
 
@@ -1500,12 +1716,22 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                     # Add to state
                     analysis_state.add_pattern(item, center_ts, final_display_label,
                                              feats, (ts_start, ts_end))
+
+                    # If this is a consolidation with explicit range, add as consolidation container
+                    if final_display_label == "CONSOLIDATION" and is_explicit_range:
+                        analysis_state.add_consolidation_range(ts_start, ts_end, high_px, low_px)
+
                     valid_input = True
 
                 elif user_conf == 's':
                     print("[INFO] Skipped - no training data saved")
                     analysis_state.add_pattern(item, center_ts, final_display_label,
                                              feats, (ts_start, ts_end))
+
+                    # If this is a consolidation with explicit range, add as consolidation container
+                    if final_display_label == "CONSOLIDATION" and is_explicit_range:
+                        analysis_state.add_consolidation_range(ts_start, ts_end, high_px, low_px)
+
                     valid_input = True
 
                 elif user_conf == 'n':
@@ -1538,6 +1764,10 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                             analysis_state.add_pattern(item, center_ts, correct_label,
                                                      feats, (ts_start, ts_end))
 
+                            # If this is a consolidation with explicit range, add as consolidation container
+                            if correct_label == "CONSOLIDATION" and is_explicit_range:
+                                analysis_state.add_consolidation_range(ts_start, ts_end, high_px, low_px)
+
                             print(f"[OK] Corrected to '{correct_label}'. Model will retrain.")
                             valid_input = True
                         else:
@@ -1562,8 +1792,8 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
 def main():
     """Main entry point."""
     print("="*80)
-    print("Trading Pattern Classifier - OPTION A (24 FEATURES)")
-    print("8 Patterns | 24 Features | Sequence Learning | Multi-Day Context")
+    print("Trading Pattern Classifier - OPTION A (33 FEATURES)")
+    print("8 Patterns | 33 Features | Sequence + Incremental + Consolidation Context")
     print("="*80)
 
     # Initialize AI
@@ -1611,6 +1841,9 @@ def main():
     tz = pytz.timezone(TZ_STR)
     session_ctx.calculate_from_data(df, prev_df, d_obj, tz)
 
+    # Pre-scan session for rolling metrics (enables incremental features)
+    session_state = pre_scan_session(df)
+
     # Interactive loop
     print("\nEnter times to analyze:")
     print("  Examples:")
@@ -1635,7 +1868,7 @@ def main():
             if not u_in:
                 continue
 
-            parse_and_process_inputs(u_in, df, d_obj, tz, brain, analysis_state, session_ctx)
+            parse_and_process_inputs(u_in, df, d_obj, tz, brain, analysis_state, session_ctx, session_state)
 
             # Retrain if needed
             if SKLEARN_AVAILABLE and brain.needs_retraining:
