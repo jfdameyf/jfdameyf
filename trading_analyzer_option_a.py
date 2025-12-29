@@ -278,6 +278,57 @@ def get_databento_data(api_key: str, date_obj: datetime.date) -> Optional[pd.Dat
         return None
 
 
+def get_previous_trading_day_data(api_key: str, current_date: datetime.date,
+                                  max_lookback_days: int = 7) -> Tuple[Optional[pd.DataFrame], Optional[datetime.date]]:
+    """
+    Find and fetch the most recent previous trading day data.
+
+    Handles weekends and market holidays by checking backwards until data is found.
+    For example:
+    - Monday → Friday
+    - Day after Christmas → day before Christmas
+    - Day after Thanksgiving → day before Thanksgiving
+
+    Args:
+        api_key: Databento API key
+        current_date: Current trading date
+        max_lookback_days: Maximum days to look back (default 7 for long weekends)
+
+    Returns:
+        Tuple of (DataFrame, date) for previous trading day, or (None, None) if not found
+    """
+    print(f"\n[PREVIOUS DAY] Finding previous trading day before {current_date.strftime('%Y-%m-%d')}...")
+
+    for days_back in range(1, max_lookback_days + 1):
+        candidate_date = current_date - timedelta(days=days_back)
+
+        # Skip obvious non-trading days (Saturday/Sunday)
+        weekday = candidate_date.weekday()
+        if weekday == 5:  # Saturday
+            print(f"[PREVIOUS DAY] Skipping {candidate_date.strftime('%Y-%m-%d')} (Saturday)")
+            continue
+        elif weekday == 6:  # Sunday
+            print(f"[PREVIOUS DAY] Skipping {candidate_date.strftime('%Y-%m-%d')} (Sunday)")
+            continue
+
+        # Try to fetch data for this candidate
+        print(f"[PREVIOUS DAY] Checking {candidate_date.strftime('%Y-%m-%d')} ({['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][weekday]})...")
+        data = get_databento_data(api_key, candidate_date)
+
+        if data is not None and not data.empty and len(data) > 100:
+            # Found valid trading day data (>100 ticks = real trading day)
+            print(f"[PREVIOUS DAY] ✓ Found previous trading day: {candidate_date.strftime('%Y-%m-%d')}")
+            return data, candidate_date
+        else:
+            # No data or insufficient data - likely a holiday
+            print(f"[PREVIOUS DAY] ✗ No sufficient data (likely holiday or half-day)")
+
+    # Couldn't find previous trading day within lookback period
+    print(f"[PREVIOUS DAY] WARNING: Could not find trading day within {max_lookback_days} days")
+    print(f"[PREVIOUS DAY] Using current day's open as baseline")
+    return None, None
+
+
 # --- 5. METRICS ENGINE ---
 def calculate_granular_metrics(df: pd.DataFrame) -> Tuple[Optional[pd.DataFrame], Dict[str, int]]:
     """Calculate per-minute metrics and period totals."""
@@ -1470,13 +1521,11 @@ def main():
 
     print(f"[DATA] Loaded {len(df)} ticks from {df.index[0]} to {df.index[-1]}")
 
-    # Fetch previous day data for context
-    prev_date = d_obj - timedelta(days=1)
-    print(f"\n[DATA] Fetching previous day data ({prev_date.strftime('%Y-%m-%d')}) for context...")
-    prev_df = get_databento_data(API_KEY, prev_date)
+    # Fetch previous trading day data (handles weekends and holidays)
+    prev_df, prev_date = get_previous_trading_day_data(API_KEY, d_obj)
 
     if prev_df is None:
-        print("[WARN] Could not fetch previous day data. Using today's open as baseline.")
+        print("[WARN] Could not find previous trading day data. Using today's open as baseline.")
 
     # Calculate session context
     tz = pytz.timezone(TZ_STR)
