@@ -2,20 +2,37 @@
 Trading Pattern Classifier - OPTION A (24 Features)
 
 SEQUENCE LEARNING VERSION:
-- 8 Pattern Types (including PULLBACK CONTINUATION)
+- 8 Pattern Types (refined taxonomy):
+  1. HOD (High of Day) - Actual session high (may or may not be significant reversal)
+  2. LOD (Low of Day) - Actual session low (may or may not be significant reversal)
+  3. REVERSAL - Significant magnitude move away from area that holds
+  4. FALSE REVERSAL - Insufficient magnitude OR fails to hold (often traps traders)
+  5. CONTINUATION - Continues after impulse/reversal started (NOT from consolidation)
+  6. PULLBACK CONTINUATION - Opposite-color pullback then resumes trend
+  7. CONSOLIDATION - Sideways, range-bound, low volatility
+  8. IMPULSE MOVE - Explosive directional move (from consolidation OR v-shape)
+
 - 24 ML Features enabling automatic sequence discovery:
   * 12 Base Features (Volume Profile + Price Velocity + Delta/Volume Analysis)
   * 4 Sequence Context Features (previous patterns, timing)
   * 8 Multi-Day/Session Context Features (gaps, initial balance, previous day levels)
+
 - Adaptive Time Windows (auto-adjusts to volatility)
 - Hierarchical Pattern Tracking (parent/child relationships)
 - ML-Based Sequence Learning (NOT hard-coded)
 - Session Visualization (auto-generated chart for cross-reference)
 
-KEY IMPROVEMENT:
-The ML model learns sequences automatically via context features, enabling it to discover
-patterns like "Gap-up → FALSE REVERSAL → PULLBACK CONTINUATION → REVERSAL = Liquidity Sweep"
-without any hard-coded rules.
+KEY IMPROVEMENTS:
+1. HOD/LOD separated from reversals (day extremes != significant reversals)
+2. REVERSAL redefined (significant magnitude that holds, not just day's extreme)
+3. FALSE REVERSAL clarified (traps traders, insufficient magnitude or fails)
+4. IMPULSE MOVE added (explosive moves from consolidation or v-shapes)
+5. ML learns sequences like "IMPULSE → FALSE REVERSAL → PULLBACK CONTINUATION"
+
+The ML model learns which sequences matter through context features, enabling discovery of
+patterns like "Gap-up near prev day high → IMPULSE → FALSE REVERSAL → PULLBACK → REVERSAL"
+without hard-coded rules. Volumes, deltas, and velocities are analyzed to distinguish
+patterns (e.g., false reversals often show weak volume + opposite delta influx).
 
 SETUP:
 1. Install dependencies: pip install databento pandas numpy scikit-learn pytz matplotlib
@@ -27,6 +44,7 @@ FEATURES:
 - Auto-adapts to trending vs consolidation days
 - Learns pattern sequences through context (not hard-coded detection)
 - Understands multi-day context (gaps, previous day levels, initial balance)
+- Handles weekends and holidays (finds previous trading day automatically)
 """
 
 import databento as db
@@ -749,14 +767,14 @@ class TradeClassifier:
         ]
 
         self.labels_map = [
-            "REVERSAL (TOP)",
-            "REVERSAL (BOTTOM)",
+            "HOD",  # High of Day
+            "LOD",  # Low of Day
+            "REVERSAL",
             "FALSE REVERSAL",
             "CONTINUATION",
             "PULLBACK CONTINUATION",
             "CONSOLIDATION",
-            "V-SHAPE",
-            "UNCERTAIN"
+            "IMPULSE MOVE"
         ]
 
     def load_model(self) -> bool:
@@ -923,55 +941,112 @@ class TradeClassifier:
             print(f"[ML] Failed to save example: {e}")
 
 
-# --- 11. HEURISTIC LOGIC (UPDATED WITH PULLBACK CONTINUATION) ---
+# --- 11. HEURISTIC LOGIC (NEW TAXONOMY) ---
 def heuristic_classify(features: Dict, high_px: float, low_px: float,
-                       duration: float) -> str:
+                       duration: float, session_high: float, session_low: float) -> str:
     """
-    Updated rule-based classification with PULLBACK CONTINUATION.
+    Rule-based classification with new 8-pattern taxonomy.
+
+    Pattern Definitions:
+    - HOD/LOD: Actual session extremes (may not be significant reversals)
+    - REVERSAL: Significant magnitude move away from area that holds
+    - FALSE REVERSAL: Insufficient magnitude OR fails to hold
+    - CONTINUATION: Continues after impulse/reversal started (NOT from consolidation)
+    - PULLBACK CONTINUATION: Opposite-color pullback then resumes
+    - CONSOLIDATION: Sideways, low volatility
+    - IMPULSE MOVE: Explosive move from consolidation OR v-shape
     """
     trend = features['trend']
     color = features['color']
     broken_high = features['broken_high']
     broken_low = features['broken_low']
     range_pts = high_px - low_px
+    velocity = abs(features.get('price_velocity', 0))
+    max_velocity = abs(features.get('max_velocity', 0))
 
-    # Consolidation check
+    # Check if this is session high or low (within 0.25 pts)
+    is_session_high = abs(high_px - session_high) < 0.25
+    is_session_low = abs(low_px - session_low) < 0.25
+
+    if is_session_high:
+        return "HOD"
+    elif is_session_low:
+        return "LOD"
+
+    # Consolidation check (low range, longer duration)
     if duration >= CONSOLIDATION_MIN_DURATION and range_pts < CONSOLIDATION_RANGE_THRESHOLD:
         return "CONSOLIDATION"
+
+    # IMPULSE MOVE: High velocity from consolidation OR v-shape
+    # V-shape: Large range, short duration, high velocity
+    is_high_velocity = velocity > 5.0 or max_velocity > 8.0
+    is_from_consolidation = trend == 0  # No prior trend = coming from consolidation
+    is_v_shape = range_pts > 3.0 and duration < 3.0 and is_high_velocity
+
+    if is_high_velocity and (is_from_consolidation or is_v_shape):
+        return "IMPULSE MOVE"
 
     # UPTREND PATTERNS
     if trend == 1:
         if color == 1:  # Green (same as trend)
+            # Check if this is continuation or false reversal
             if broken_low == 0:
                 return "CONTINUATION"
             else:
+                # Broke low = false reversal (failed to hold)
                 return "FALSE REVERSAL"
 
-        elif color == -1:  # Red (pullback)
+        elif color == -1:  # Red (pullback in uptrend)
             if broken_high == 1:
-                return "PULLBACK CONTINUATION"  # Breaks above pullback
+                # Breaks back above = pullback continuation
+                return "PULLBACK CONTINUATION"
             elif broken_high == 0 and broken_low == 0:
-                return "REVERSAL (TOP)"  # True reversal
+                # Holds without breaking either direction
+                # Check magnitude to distinguish REVERSAL from FALSE REVERSAL
+                if range_pts > 2.0:  # Significant magnitude
+                    return "REVERSAL"
+                else:
+                    return "FALSE REVERSAL"
             else:
+                # Broke low = failed reversal
                 return "FALSE REVERSAL"
 
     # DOWNTREND PATTERNS
     elif trend == -1:
         if color == -1:  # Red (same as trend)
+            # Check if this is continuation or false reversal
             if broken_high == 0:
                 return "CONTINUATION"
             else:
+                # Broke high = false reversal (failed to hold)
                 return "FALSE REVERSAL"
 
-        elif color == 1:  # Green (bounce)
+        elif color == 1:  # Green (bounce in downtrend)
             if broken_low == 1:
-                return "PULLBACK CONTINUATION"  # Breaks below bounce
+                # Breaks back below = pullback continuation
+                return "PULLBACK CONTINUATION"
             elif broken_low == 0 and broken_high == 0:
-                return "REVERSAL (BOTTOM)"  # True reversal
+                # Holds without breaking either direction
+                # Check magnitude to distinguish REVERSAL from FALSE REVERSAL
+                if range_pts > 2.0:  # Significant magnitude
+                    return "REVERSAL"
+                else:
+                    return "FALSE REVERSAL"
             else:
+                # Broke high = failed reversal
                 return "FALSE REVERSAL"
 
-    return "UNCERTAIN"
+    # No clear trend - check for impulse or consolidation
+    if is_high_velocity and range_pts > 2.0:
+        return "IMPULSE MOVE"
+    elif range_pts < CONSOLIDATION_RANGE_THRESHOLD:
+        return "CONSOLIDATION"
+
+    # Default: if significant range, call it reversal
+    if range_pts > 2.0:
+        return "REVERSAL"
+
+    return "CONSOLIDATION"
 
 
 # --- 12. PATTERN ANALYSIS STATE (ENHANCED FOR SEQUENCE LEARNING) ---
@@ -982,14 +1057,14 @@ class PatternAnalysisState:
         self.analyzed_patterns = []  # List of dicts
         self.analyzed_times = []  # List of datetimes
         self.pattern_label_encoder = {
-            "REVERSAL (TOP)": 1,
-            "REVERSAL (BOTTOM)": 2,
-            "FALSE REVERSAL": 3,
-            "CONTINUATION": 4,
-            "PULLBACK CONTINUATION": 5,
-            "CONSOLIDATION": 6,
-            "V-SHAPE": 7,
-            "UNCERTAIN": 8
+            "HOD": 1,
+            "LOD": 2,
+            "REVERSAL": 3,
+            "FALSE REVERSAL": 4,
+            "CONTINUATION": 5,
+            "PULLBACK CONTINUATION": 6,
+            "CONSOLIDATION": 7,
+            "IMPULSE MOVE": 8
         }
 
     def encode_pattern_label(self, label: str) -> int:
@@ -1132,14 +1207,14 @@ def generate_session_chart(df: pd.DataFrame, analysis_state: PatternAnalysisStat
 
     # Pattern color mapping
     pattern_colors = {
-        'REVERSAL (TOP)': '#FF4444',  # Red
-        'REVERSAL (BOTTOM)': '#44FF44',  # Green
-        'FALSE REVERSAL': '#FFA500',  # Orange
-        'CONTINUATION': '#4444FF',  # Blue
-        'PULLBACK CONTINUATION': '#00CED1',  # Dark Cyan
-        'CONSOLIDATION': '#DAA520',  # Goldenrod
-        'V-SHAPE': '#FF00FF',  # Magenta
-        'UNCERTAIN': '#808080'  # Gray
+        'HOD': '#FF4444',  # Red - High of Day
+        'LOD': '#44FF44',  # Green - Low of Day
+        'REVERSAL': '#9370DB',  # Medium Purple - Significant reversal
+        'FALSE REVERSAL': '#FFA500',  # Orange - Failed reversal
+        'CONTINUATION': '#4444FF',  # Blue - Continues trend
+        'PULLBACK CONTINUATION': '#00CED1',  # Dark Cyan - Pullback then resume
+        'CONSOLIDATION': '#DAA520',  # Goldenrod - Sideways
+        'IMPULSE MOVE': '#FF00FF'  # Magenta - Explosive move
     }
 
     # Create figure with 2 subplots
@@ -1367,7 +1442,11 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
             duration = feats['duration_mins']
 
             # GET PREDICTIONS
-            heuristic_label = heuristic_classify(feats, high_px, low_px, duration)
+            # Calculate session high/low for HOD/LOD detection
+            session_high = df['price'].max()
+            session_low = df['price'].min()
+            heuristic_label = heuristic_classify(feats, high_px, low_px, duration,
+                                                session_high, session_low)
             ml_label, confidence = ai_brain.predict_with_confidence(feats)
 
             # Decide what to show
@@ -1432,13 +1511,14 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                 elif user_conf == 'n':
                     print("\nSelect Correct Label:")
                     options = [
-                        "REVERSAL (TOP)",
-                        "REVERSAL (BOTTOM)",
+                        "HOD",
+                        "LOD",
+                        "REVERSAL",
                         "FALSE REVERSAL",
                         "CONTINUATION",
                         "PULLBACK CONTINUATION",
                         "CONSOLIDATION",
-                        "V-SHAPE"
+                        "IMPULSE MOVE"
                     ]
                     for i, opt in enumerate(options):
                         print(f" {i+1}. {opt}")
