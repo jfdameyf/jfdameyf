@@ -130,7 +130,7 @@ MIN_WINDOW_MINUTES = 5
 MAX_WINDOW_MINUTES = 15
 
 # Separation Parameters
-MIN_SEPARATION_MINUTES = 15  # Minimum time between analyses
+MIN_SEPARATION_MINUTES = 0  # Allow close-together patterns (incremental features handle this)
 
 # ML Parameters
 RF_N_ESTIMATORS = 100
@@ -816,7 +816,8 @@ def extract_features(pre_df: pd.DataFrame, event_df: pd.DataFrame,
             last_features = last_pattern.get('features', {})
 
             # Calculate CHANGE since last pattern (not absolute values)
-            delta_change_since_last = totals.get('net_delta', 0) - last_features.get('total_vol', 0) * last_features.get('delta_imbalance', 0)
+            # Use stored net_delta directly instead of reconstructing
+            delta_change_since_last = totals.get('net_delta', 0) - last_features.get('net_delta', 0)
             volume_change_since_last = total_vol - last_features.get('total_vol', 0)
             price_change_since_last = close_px - last_features.get('price', close_px)
 
@@ -848,6 +849,10 @@ def extract_features(pre_df: pd.DataFrame, event_df: pd.DataFrame,
         'poi_position': poi_position,
         'price_velocity': overall_velocity,
         'max_velocity': max_velocity,
+
+        # Reference values (stored for incremental calculations)
+        'net_delta': totals.get('net_delta', 0),
+        'price': close_px,
 
         # Sequence context features (13-16)
         'previous_pattern_1': previous_pattern_1,
