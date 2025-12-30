@@ -1134,54 +1134,66 @@ def heuristic_classify(features: Dict, high_px: float, low_px: float,
     if is_high_velocity and (is_from_consolidation or is_v_shape):
         return "IMPULSE MOVE"
 
+    # Check if previous pattern was a false reversal (indicates pullback that failed)
+    previous_was_false_reversal = features.get('previous_pattern_1', 0) == 4  # FALSE REVERSAL = 4
+
     # UPTREND PATTERNS
     if trend == 1:
         if color == 1:  # Green (same as trend)
-            # Check if this is continuation or false reversal
-            if broken_low == 0:
-                return "CONTINUATION"
+            # Check if this is continuation AFTER a false reversal (pullback that failed)
+            # User's interpretation: 6005→6015 after 6010→6005 pullback
+            if previous_was_false_reversal and broken_low == 0:
+                return "PULLBACK CONTINUATION"  # Continuing up after pullback failed
+            elif broken_low == 0:
+                return "CONTINUATION"  # Normal continuation
             else:
                 # Broke low = false reversal (failed to hold)
                 return "FALSE REVERSAL"
 
         elif color == -1:  # Red (pullback in uptrend)
+            # User's interpretation: 6010→6005 pullback = FALSE REVERSAL
+            # The CLOSE being lower is what makes it a false reversal
             if broken_high == 1:
-                # Breaks back above = pullback continuation
-                return "PULLBACK CONTINUATION"
+                # Breaks back above later = pullback failed to hold
+                return "FALSE REVERSAL"
             elif broken_high == 0 and broken_low == 0:
                 # Holds without breaking either direction
                 # Check magnitude to distinguish REVERSAL from FALSE REVERSAL
                 if range_pts > 2.0:  # Significant magnitude
                     return "REVERSAL"
                 else:
-                    return "FALSE REVERSAL"
+                    return "FALSE REVERSAL"  # Small pullback that holds
             else:
-                # Broke low = failed reversal
+                # Broke low = continued down, failed as pullback
                 return "FALSE REVERSAL"
 
     # DOWNTREND PATTERNS
     elif trend == -1:
         if color == -1:  # Red (same as trend)
-            # Check if this is continuation or false reversal
-            if broken_high == 0:
-                return "CONTINUATION"
+            # Check if this is continuation AFTER a false reversal (bounce that failed)
+            if previous_was_false_reversal and broken_high == 0:
+                return "PULLBACK CONTINUATION"  # Continuing down after bounce failed
+            elif broken_high == 0:
+                return "CONTINUATION"  # Normal continuation
             else:
                 # Broke high = false reversal (failed to hold)
                 return "FALSE REVERSAL"
 
         elif color == 1:  # Green (bounce in downtrend)
+            # Bounce in downtrend = FALSE REVERSAL
+            # The CLOSE being higher is what makes it a false reversal
             if broken_low == 1:
-                # Breaks back below = pullback continuation
-                return "PULLBACK CONTINUATION"
+                # Breaks back below later = bounce failed to hold
+                return "FALSE REVERSAL"
             elif broken_low == 0 and broken_high == 0:
                 # Holds without breaking either direction
                 # Check magnitude to distinguish REVERSAL from FALSE REVERSAL
                 if range_pts > 2.0:  # Significant magnitude
                     return "REVERSAL"
                 else:
-                    return "FALSE REVERSAL"
+                    return "FALSE REVERSAL"  # Small bounce that holds
             else:
-                # Broke high = failed reversal
+                # Broke high = continued up, failed as bounce
                 return "FALSE REVERSAL"
 
     # No clear trend - check for impulse or consolidation
