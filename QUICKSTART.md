@@ -2,6 +2,12 @@
 
 Get up and running with the Market Data Analyzer in 5 minutes!
 
+**Latest Updates:**
+- ✅ Data quality validation (removes corrupt/outlier prices)
+- ✅ All timestamps now in UTC for clarity
+- ✅ Better debugging and error messages
+- ✅ See [DATA_QUALITY_FIXES.md](DATA_QUALITY_FIXES.md) for details
+
 ## Step 1: Install Dependencies
 
 ```bash
@@ -52,6 +58,11 @@ Run it:
 ```bash
 python my_analysis.py
 ```
+
+**Note:** All timestamps are in UTC. For US markets:
+- RTH 9:30 AM Eastern = 13:30 or 14:30 UTC (depending on DST)
+- The script handles this automatically for RTH filtering
+- See "Understanding Timestamps" section below
 
 ## Step 4: Explore Examples
 
@@ -135,6 +146,56 @@ df = analyzer.analyze(
 | `RTY.FUT` | E-mini Russell 2000 |
 | `GC.FUT` | Gold Futures |
 | `CL.FUT` | Crude Oil Futures |
+
+## Understanding Timestamps
+
+**All timestamps are in UTC (Coordinated Universal Time)**
+
+### What This Means
+- Each timestamp represents the **START** of a candle period
+- For 1-minute candles: `13:30:00` = candle from 13:30:00 to 13:30:59
+- For 5-minute candles: `13:30:00` = candle from 13:30:00 to 13:34:59
+
+### UTC to US/Eastern Conversion
+- **EST (winter):** UTC - 5 hours  → 13:30 UTC = 8:30 AM EST
+- **EDT (summer):** UTC - 4 hours → 13:30 UTC = 9:30 AM EDT
+
+### RTH (Regular Trading Hours)
+The script automatically handles RTH filtering:
+- RTH for ES: 9:30 AM - 4:00 PM Eastern
+- In UTC: ~13:30-20:00 (EST) or ~13:30-20:00 (EDT)
+- The script converts internally - you don't need to worry about it!
+
+### Convert to Your Timezone
+```python
+# Convert to US/Eastern for display
+df_eastern = analyzer.convert_timezone(df, 'US/Eastern')
+
+# Convert to other timezones
+df_london = analyzer.convert_timezone(df, 'Europe/London')
+df_tokyo = analyzer.convert_timezone(df, 'Asia/Tokyo')
+```
+
+## Data Quality & Validation
+
+The script automatically validates and cleans data:
+
+✅ **Checks performed:**
+- High >= Low
+- Open and Close within [Low, High]
+- Outlier detection (removes extreme prices)
+- Filters out zero/negative prices
+- Symbol filtering (single symbol only)
+
+✅ **What you'll see:**
+```
+WARNING: Found 4 extreme price outliers
+  Price bounds: 6700.00 to 6900.00
+Data validation: Removed 4 corrupt rows (0.3%)
+Clean data: 1560 rows remaining
+```
+
+This is normal and good! The script detected and removed bad data automatically.
 
 ## Troubleshooting
 

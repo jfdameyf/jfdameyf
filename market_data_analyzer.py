@@ -64,6 +64,74 @@ class MarketDataAnalyzer:
         # Initialize Databento client
         self.client = db.Historical(self.api_key)
 
+    def _validate_ohlcv_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Validate and clean OHLCV data to remove corrupt/outlier records
+
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            Cleaned DataFrame
+        """
+        if df.empty:
+            return df
+
+        required_cols = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            print("WARNING: Cannot validate - missing OHLCV columns")
+            return df
+
+        initial_len = len(df)
+
+        # Rule 1: high >= low (basic sanity check)
+        invalid_high_low = df['high'] < df['low']
+        if invalid_high_low.any():
+            print(f"WARNING: Found {invalid_high_low.sum()} rows where high < low")
+            df = df[~invalid_high_low]
+
+        # Rule 2: open and close should be between low and high
+        invalid_open = (df['open'] < df['low']) | (df['open'] > df['high'])
+        invalid_close = (df['close'] < df['low']) | (df['close'] > df['high'])
+
+        if invalid_open.any():
+            print(f"WARNING: Found {invalid_open.sum()} rows where open is outside [low, high]")
+            df = df[~invalid_open]
+
+        if invalid_close.any():
+            print(f"WARNING: Found {invalid_close.sum()} rows where close is outside [low, high]")
+            df = df[~invalid_close]
+
+        # Rule 3: Detect extreme outliers using IQR method on close prices
+        if len(df) > 10:  # Need sufficient data for statistical analysis
+            Q1 = df['close'].quantile(0.25)
+            Q3 = df['close'].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 3 * IQR  # Use 3*IQR for extreme outliers
+            upper_bound = Q3 + 3 * IQR
+
+            outliers = (df['close'] < lower_bound) | (df['close'] > upper_bound)
+            if outliers.any():
+                print(f"WARNING: Found {outliers.sum()} extreme price outliers")
+                print(f"  Price bounds: {lower_bound:.2f} to {upper_bound:.2f}")
+                outlier_rows = df[outliers][['open', 'high', 'low', 'close', 'volume']].head()
+                print("  Sample outliers:")
+                print(outlier_rows)
+                df = df[~outliers]
+
+        # Rule 4: Check for zero or negative prices
+        zero_prices = (df[['open', 'high', 'low', 'close']] <= 0).any(axis=1)
+        if zero_prices.any():
+            print(f"WARNING: Found {zero_prices.sum()} rows with zero or negative prices")
+            df = df[~zero_prices]
+
+        removed = initial_len - len(df)
+        if removed > 0:
+            print(f"Data validation: Removed {removed} corrupt/outlier rows ({removed/initial_len*100:.1f}%)")
+            print(f"Clean data: {len(df)} rows remaining")
+
+        return df
+
     def fetch_data(
         self,
         symbol: str,
@@ -134,16 +202,28 @@ class MarketDataAnalyzer:
                 else:
                     print("WARNING: Could not find datetime column for index")
 
-            # Ensure index is timezone-aware (convert to UTC if needed)
+            # Keep timezone in UTC for safety and clarity
             if df.index.tz is None:
                 df.index = df.index.tz_localize('UTC')
-            else:
+            elif df.index.tz != 'UTC':
                 df.index = df.index.tz_convert('UTC')
 
-            # Convert to US/Eastern for standard market hours
-            df.index = df.index.tz_convert('US/Eastern')
-
             print(f"Index range: {df.index.min()} to {df.index.max()}")
+
+            # Filter to only the requested symbol if 'symbol' column exists
+            if 'symbol' in df.columns:
+                unique_symbols = df['symbol'].unique()
+                print(f"Symbols in data: {unique_symbols}")
+
+                # Keep only the primary symbol (first one)
+                if len(unique_symbols) > 1:
+                    primary_symbol = unique_symbols[0]
+                    print(f"WARNING: Multiple symbols found. Filtering to: {primary_symbol}")
+                    df = df[df['symbol'] == primary_symbol]
+                    print(f"Filtered to {len(df)} records")
+
+            # Validate and clean data
+            df = self._validate_ohlcv_data(df)
 
             return df
 
@@ -163,19 +243,23 @@ class MarketDataAnalyzer:
         """
         Filter DataFrame to only include Regular Trading Hours (RTH)
 
+        Note: RTH hours are defined in US/Eastern time. This method will
+        temporarily convert UTC timestamps to US/Eastern for filtering,
+        then convert back to UTC.
+
         Args:
-            df: DataFrame with datetime index
+            df: DataFrame with datetime index (should be in UTC)
             symbol_prefix: Symbol prefix (e.g., 'ES', 'NQ') to determine RTH hours
             custom_start: Custom RTH start time (overrides default)
             custom_end: Custom RTH end time (overrides default)
 
         Returns:
-            Filtered DataFrame with only RTH data
+            Filtered DataFrame with only RTH data (in UTC)
         """
         if df.empty:
             return df
 
-        # Determine RTH hours
+        # Determine RTH hours (these are in US/Eastern time)
         if custom_start and custom_end:
             rth_start = custom_start
             rth_end = custom_end
@@ -186,10 +270,17 @@ class MarketDataAnalyzer:
             rth_start = self.RTH_HOURS['default']['start']
             rth_end = self.RTH_HOURS['default']['end']
 
-        print(f"Filtering for RTH: {rth_start} to {rth_end}")
+        print(f"Filtering for RTH (US/Eastern): {rth_start} to {rth_end}")
+
+        # Convert to US/Eastern for filtering
+        df_eastern = df.copy()
+        df_eastern.index = df_eastern.index.tz_convert('US/Eastern')
 
         # Filter by time
-        df_rth = df.between_time(rth_start, rth_end)
+        df_rth = df_eastern.between_time(rth_start, rth_end)
+
+        # Convert back to UTC
+        df_rth.index = df_rth.index.tz_convert('UTC')
 
         print(f"RTH records: {len(df_rth)} (filtered from {len(df)})")
 
@@ -234,6 +325,38 @@ class MarketDataAnalyzer:
         print(f"Resampled to {len(df_resampled)} candles")
 
         return df_resampled
+
+    def convert_timezone(
+        self,
+        df: pd.DataFrame,
+        target_tz: str = 'US/Eastern'
+    ) -> pd.DataFrame:
+        """
+        Convert DataFrame index to a different timezone
+
+        Args:
+            df: DataFrame with timezone-aware datetime index
+            target_tz: Target timezone (e.g., 'US/Eastern', 'Europe/London', 'Asia/Tokyo')
+
+        Returns:
+            DataFrame with index converted to target timezone
+        """
+        if df.empty:
+            return df
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            print("WARNING: Index is not a DatetimeIndex, cannot convert timezone")
+            return df
+
+        if df.index.tz is None:
+            print("WARNING: Index is not timezone-aware, cannot convert")
+            return df
+
+        print(f"Converting from {df.index.tz} to {target_tz}")
+        df_converted = df.copy()
+        df_converted.index = df_converted.index.tz_convert(target_tz)
+
+        return df_converted
 
     def plot_candlestick_matplotlib(
         self,
@@ -374,11 +497,20 @@ class MarketDataAnalyzer:
             return
 
         # Debug: Print data summary
-        print(f"\nPlotting {len(df)} candles")
+        print(f"\n{'='*60}")
+        print(f"PLOTTING {len(df)} CANDLES")
+        print(f"{'='*60}")
         print(f"Date range: {df.index.min()} to {df.index.max()}")
-        print(f"Price range: {df['low'].min():.2f} to {df['high'].max():.2f}")
-        print(f"Sample data:")
+        print(f"  (timestamps represent START of each candle period)")
+        print(f"Price range: ${df['low'].min():.2f} - ${df['high'].max():.2f}")
+        print(f"\nFirst 5 candles:")
         print(df[['open', 'high', 'low', 'close', 'volume']].head())
+        print(f"\nData quality check:")
+        print(f"  All prices > 0: {(df[['open', 'high', 'low', 'close']] > 0).all().all()}")
+        print(f"  High >= Low: {(df['high'] >= df['low']).all()}")
+        print(f"  Open in [Low, High]: {((df['open'] >= df['low']) & (df['open'] <= df['high'])).all()}")
+        print(f"  Close in [Low, High]: {((df['close'] >= df['low']) & (df['close'] <= df['high'])).all()}")
+        print(f"{'='*60}\n")
 
         # Create subplots
         fig = make_subplots(
@@ -481,18 +613,21 @@ class MarketDataAnalyzer:
         df = self.resample_candles(df, timeframe)
 
         # Print summary statistics
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("DATA SUMMARY")
-        print("="*60)
+        print("="*70)
         print(f"Symbol: {symbol}")
-        print(f"Date Range: {start_date} to {end_date}")
+        print(f"Request Range: {start_date} to {end_date}")
         print(f"Timeframe: {timeframe}")
         print(f"RTH Only: {rth_only}")
         print(f"Total Candles: {len(df)}")
         if not df.empty:
+            print(f"Actual Range: {df.index.min()} to {df.index.max()}")
+            print(f"  (All times in UTC)")
+            print(f"  (Each timestamp = START of candle period)")
             print(f"Price Range: ${df['low'].min():.2f} - ${df['high'].max():.2f}")
             print(f"Avg Volume: {df['volume'].mean():.0f}")
-        print("="*60 + "\n")
+        print("="*70 + "\n")
 
         # Create visualizations
         chart_title = f"{symbol} - {timeframe} Candles ({start_date} to {end_date})"
