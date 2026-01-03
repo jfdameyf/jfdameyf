@@ -109,20 +109,48 @@ class MarketDataAnalyzer:
 
             print(f"Fetched {len(df)} records")
 
-            # Ensure timestamp is datetime
-            if 'ts_event' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['ts_event'])
-            else:
-                df['timestamp'] = df.index
+            # Debug: Print column names and data types
+            print(f"\nColumns in data: {df.columns.tolist()}")
+            print(f"Index name: {df.index.name}")
+            print(f"Data types:\n{df.dtypes}")
 
-            # Set timestamp as index if not already
-            if df.index.name != 'ts_event':
-                df.set_index('timestamp', inplace=True)
+            # Print first few rows to see the data structure
+            print(f"\nFirst few rows of data:")
+            print(df.head())
+
+            # Check if we have the expected columns
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+
+            if missing_cols:
+                print(f"WARNING: Missing expected columns: {missing_cols}")
+                print(f"Available columns: {df.columns.tolist()}")
+
+            # Ensure proper datetime index
+            if not isinstance(df.index, pd.DatetimeIndex):
+                if 'ts_event' in df.columns:
+                    df.index = pd.to_datetime(df['ts_event'])
+                    df.drop('ts_event', axis=1, inplace=True, errors='ignore')
+                else:
+                    print("WARNING: Could not find datetime column for index")
+
+            # Ensure index is timezone-aware (convert to UTC if needed)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('UTC')
+            else:
+                df.index = df.index.tz_convert('UTC')
+
+            # Convert to US/Eastern for standard market hours
+            df.index = df.index.tz_convert('US/Eastern')
+
+            print(f"Index range: {df.index.min()} to {df.index.max()}")
 
             return df
 
         except Exception as e:
             print(f"Error fetching data: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
     def filter_rth(
@@ -233,6 +261,15 @@ class MarketDataAnalyzer:
         # Convert timestamps for matplotlib
         timestamps = mdates.date2num(df.index.to_pydatetime())
 
+        # Calculate appropriate width for candles based on time differences
+        if len(timestamps) > 1:
+            # Use median time difference to handle gaps
+            time_diffs = np.diff(timestamps)
+            median_diff = np.median(time_diffs)
+            candle_width = median_diff * 0.6  # 60% of the time interval
+        else:
+            candle_width = 0.0003  # Default fallback
+
         # Plot candlesticks
         for i, (idx, row) in enumerate(df.iterrows()):
             timestamp = timestamps[i]
@@ -244,24 +281,38 @@ class MarketDataAnalyzer:
             body_height = abs(row['close'] - row['open'])
             body_bottom = min(row['open'], row['close'])
 
+            # If body height is 0 (open == close), make it minimally visible
+            if body_height == 0:
+                body_height = (row['high'] - row['low']) * 0.01 if row['high'] != row['low'] else 0.1
+
             rect = Rectangle(
-                (timestamp - 0.0003, body_bottom),
-                0.0006,
+                (timestamp - candle_width/2, body_bottom),
+                candle_width,
                 body_height,
                 facecolor=color,
                 edgecolor='black',
-                linewidth=0.5
+                linewidth=0.5,
+                alpha=0.8
             )
             ax1.add_patch(rect)
 
             # Draw wicks
             ax1.plot([timestamp, timestamp],
                     [row['low'], row['high']],
-                    color='black', linewidth=0.5)
+                    color='black', linewidth=1.0)
 
-        # Format x-axis
+        # Format x-axis with adaptive date formatting
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+
+        # Adaptive tick locator based on data span
+        time_span = timestamps[-1] - timestamps[0]
+        if time_span < 1:  # Less than 1 day
+            ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        elif time_span < 7:  # Less than a week
+            ax1.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+        else:
+            ax1.xaxis.set_major_locator(mdates.DayLocator())
+
         plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
         ax1.set_ylabel('Price')
@@ -272,11 +323,18 @@ class MarketDataAnalyzer:
         # Plot volume
         volume_colors = ['green' if row['close'] >= row['open'] else 'red'
                         for _, row in df.iterrows()]
-        ax2.bar(timestamps, df['volume'], color=volume_colors, width=0.0006)
+        ax2.bar(timestamps, df['volume'], color=volume_colors, width=candle_width, alpha=0.8)
         ax2.set_ylabel('Volume')
         ax2.set_xlabel('Time')
         ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-        ax2.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+
+        if time_span < 1:
+            ax2.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        elif time_span < 7:
+            ax2.xaxis.set_major_locator(mdates.HourLocator(interval=6))
+        else:
+            ax2.xaxis.set_major_locator(mdates.DayLocator())
+
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
         ax2.grid(True, alpha=0.3)
 
@@ -306,6 +364,22 @@ class MarketDataAnalyzer:
             print("No data to plot")
             return
 
+        # Validate required columns
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+
+        if missing_cols:
+            print(f"ERROR: Missing required columns for plotting: {missing_cols}")
+            print(f"Available columns: {df.columns.tolist()}")
+            return
+
+        # Debug: Print data summary
+        print(f"\nPlotting {len(df)} candles")
+        print(f"Date range: {df.index.min()} to {df.index.max()}")
+        print(f"Price range: {df['low'].min():.2f} to {df['high'].max():.2f}")
+        print(f"Sample data:")
+        print(df[['open', 'high', 'low', 'close', 'volume']].head())
+
         # Create subplots
         fig = make_subplots(
             rows=2, cols=1,
@@ -323,7 +397,9 @@ class MarketDataAnalyzer:
                 high=df['high'],
                 low=df['low'],
                 close=df['close'],
-                name='OHLC'
+                name='OHLC',
+                increasing_line_color='green',
+                decreasing_line_color='red'
             ),
             row=1, col=1
         )
@@ -348,7 +424,8 @@ class MarketDataAnalyzer:
             xaxis_rangeslider_visible=False,
             height=800,
             showlegend=True,
-            hovermode='x unified'
+            hovermode='x unified',
+            template='plotly_white'
         )
 
         fig.update_xaxes(title_text="Time", row=2, col=1)

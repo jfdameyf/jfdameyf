@@ -138,15 +138,34 @@ df = analyzer.analyze(
 
 ## Troubleshooting
 
+### Run the Diagnostic Tool
+
+If you're having issues, run the diagnostic script first:
+
+```bash
+python diagnostic.py
+```
+
+This will test your setup and identify potential problems.
+
+### Common Issues
+
 **Problem: "No data returned"**
 - Check your date range is within your Databento subscription
 - Verify the symbol format (use `.FUT` suffix)
 - Try a different date range
+- Run `python diagnostic.py` to test your connection
 
 **Problem: "API key not found"**
 - Make sure you created the `.env` file
 - Check that your key starts with `db-`
 - Verify the key in your Databento portal
+
+**Problem: "Chart looks weird/compressed"**
+- This was fixed in the latest version
+- Make sure you have the latest code
+- The debug output will show what data was received
+- Check that OHLCV columns are present in the output
 
 **Problem: "Chart not displaying"**
 - If using Plotly, it will open in your browser
