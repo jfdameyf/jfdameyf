@@ -74,18 +74,18 @@ class StrategyManager:
         self.active_monitors = self.load_state()
 
         if not self.use_poc_filter:
-            logging.info("⚠️ NOTE: POC Distance Filter is DISABLED.")
+            logging.info("NOTE: POC Distance Filter is DISABLED.")
 
     def load_latest_context(self):
         """Loads the most recent plan with validation"""
         if not os.path.exists(OUTPUT_FILE):
-            logging.error(f"⚠️ {OUTPUT_FILE} not found. Run MarketPlanner first.")
+            logging.error(f"ERROR: {OUTPUT_FILE} not found. Run MarketPlanner first.")
             return {}
         try:
             with open(OUTPUT_FILE, 'r') as f:
                 content = f.read()
                 if not content.strip():
-                    logging.error("❌ Context file is empty!")
+                    logging.error("ERROR: Context file is empty!")
                     return {}
 
                 data = json.loads(content)
@@ -96,7 +96,7 @@ class StrategyManager:
                 plan = data[last_date]
 
                 if plan is None:
-                    logging.error(f"⚠️ Plan for {last_date} is corrupted (NULL).")
+                    logging.error(f"ERROR: Plan for {last_date} is corrupted (NULL).")
                     return {}
 
                 # Validate freshness
@@ -105,19 +105,19 @@ class StrategyManager:
                 age_days = (today - plan_date).days
 
                 if age_days > 1:
-                    logging.warning(f"⚠️ WARNING: Plan is {age_days} days old!")
+                    logging.warning(f"WARNING: Plan is {age_days} days old!")
 
                 # Validate required fields
                 required = ['current_price', 'levels', 'pd_profile']
                 missing = [f for f in required if f not in plan]
                 if missing:
-                    logging.error(f"❌ Plan missing fields: {missing}")
+                    logging.error(f"ERROR: Plan missing fields: {missing}")
                     return {}
 
-                logging.info(f"✅ Strategy Loaded NQ Plan for: {last_date}")
+                logging.info(f"Strategy Loaded NQ Plan for: {last_date}")
                 return plan
         except Exception as e:
-            logging.error(f"❌ Error loading context: {e}")
+            logging.error(f"ERROR: Error loading context: {e}")
             return {}
 
     def load_state(self):
@@ -133,9 +133,9 @@ class StrategyManager:
                           if v.get('timestamp', cutoff + 1) > cutoff}
 
                 if len(cleaned) < len(data):
-                    logging.info(f"🧹 Cleaned {len(data) - len(cleaned)} stale monitors")
+                    logging.info(f"Cleaned {len(data) - len(cleaned)} stale monitors")
 
-                logging.info(f"🔄 Resumed: Tracking {len(cleaned)} NQ recaptures.")
+                logging.info(f"Resumed: Tracking {len(cleaned)} NQ recaptures.")
                 return cleaned
             except:
                 return {}
@@ -152,7 +152,7 @@ class StrategyManager:
             with open(STATE_FILE, 'w') as f:
                 json.dump(self.active_monitors, f, indent=4)
         except Exception as e:
-            logging.warning(f"⚠️ Failed to save state: {e}")
+            logging.warning(f"WARNING: Failed to save state: {e}")
 
     def get_poc_distance_modifier(self, current_price):
         """POC distance logic (NQ scaled)"""
@@ -277,7 +277,7 @@ class StrategyManager:
                 elif current_price > level_price + RECLAIM_BUFFER:
                     if monitor['extension'] >= MIN_EXTENSION:
                         monitor['state'] = 'TRIGGERED'
-                        logging.info(f"🔥 Monitor {key}: TRIGGERED! (ext: {monitor['extension']:.2f})")
+                        logging.info(f"SIGNAL - Monitor {key}: TRIGGERED! (ext: {monitor['extension']:.2f})")
                         self.active_monitors.pop(key)
                         self.save_state()
                         return "TRIGGER"
@@ -318,7 +318,7 @@ class StrategyManager:
                 elif current_price < level_price - RECLAIM_BUFFER:
                     if monitor['extension'] >= MIN_EXTENSION:
                         monitor['state'] = 'TRIGGERED'
-                        logging.info(f"🔥 Monitor {key}: TRIGGERED! (ext: {monitor['extension']:.2f})")
+                        logging.info(f"SIGNAL - Monitor {key}: TRIGGERED! (ext: {monitor['extension']:.2f})")
                         self.active_monitors.pop(key)
                         self.save_state()
                         return "TRIGGER"
