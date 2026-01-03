@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+Market Data Analyzer - Fetch and visualize historical market data from Databento
+
+This script allows you to:
+- Fetch historical market data for any date range
+- Rebuild candles at custom timeframes (1min, 3min, 5min, etc.)
+- Filter for Regular Trading Hours (RTH)
+- Visualize candlestick charts for analysis
+
+Author: Market Data Analysis Tool
+Date: 2026-01-03
+"""
+
+import os
+import sys
+from datetime import datetime, time
+from typing import Optional, Literal
+import pandas as pd
+import numpy as np
+import databento as db
+from dotenv import load_dotenv
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+class MarketDataAnalyzer:
+    """Fetches and analyzes market data from Databento"""
+
+    # Regular Trading Hours (RTH) definitions for major markets
+    RTH_HOURS = {
+        'ES': {'start': time(9, 30), 'end': time(16, 0)},  # E-mini S&P 500
+        'NQ': {'start': time(9, 30), 'end': time(16, 0)},  # E-mini NASDAQ
+        'YM': {'start': time(9, 30), 'end': time(16, 0)},  # E-mini Dow
+        'RTY': {'start': time(9, 30), 'end': time(16, 0)}, # E-mini Russell 2000
+        'GC': {'start': time(8, 20), 'end': time(13, 30)}, # Gold Futures
+        'CL': {'start': time(9, 0), 'end': time(14, 30)},  # Crude Oil
+        'ZB': {'start': time(8, 20), 'end': time(15, 0)},  # 30-Year Treasury Bond
+        'default': {'start': time(9, 30), 'end': time(16, 0)}
+    }
+
+    def __init__(self, api_key: Optional[str] = None):
+        """
+        Initialize the Market Data Analyzer
+
+        Args:
+            api_key: Databento API key. If None, will look for DATABENTO_API_KEY env variable
+        """
+        # Load environment variables from .env file if it exists
+        load_dotenv()
+
+        # Get API key from parameter or environment
+        self.api_key = api_key or os.getenv('DATABENTO_API_KEY')
+
+        if not self.api_key:
+            raise ValueError(
+                "Databento API key not found. Either pass it as a parameter or "
+                "set the DATABENTO_API_KEY environment variable"
+            )
+
+        # Initialize Databento client
+        self.client = db.Historical(self.api_key)
+
+    def fetch_data(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        dataset: str = 'GLBX.MDP3',
+        schema: str = 'ohlcv-1m',
+        stype_in: str = 'parent'
+    ) -> pd.DataFrame:
+        """
+        Fetch historical market data from Databento
+
+        Args:
+            symbol: Trading symbol (e.g., 'ES.FUT', 'NQ.FUT')
+            start_date: Start date in format 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'
+            end_date: End date in format 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'
+            dataset: Databento dataset (default: 'GLBX.MDP3' for CME Globex)
+            schema: Data schema (default: 'ohlcv-1m' for 1-minute OHLCV)
+            stype_in: Symbol input type (default: 'parent' for continuous contracts)
+
+        Returns:
+            DataFrame with OHLCV data
+        """
+        print(f"Fetching data for {symbol} from {start_date} to {end_date}...")
+
+        try:
+            # Fetch data from Databento
+            data = self.client.timeseries.get_range(
+                dataset=dataset,
+                symbols=symbol,
+                stype_in=stype_in,
+                schema=schema,
+                start=start_date,
+                end=end_date,
+            )
+
+            # Convert to DataFrame
+            df = data.to_df()
+
+            if df.empty:
+                print("Warning: No data returned from Databento")
+                return df
+
+            print(f"Fetched {len(df)} records")
+
+            # Ensure timestamp is datetime
+            if 'ts_event' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['ts_event'])
+            else:
+                df['timestamp'] = df.index
+
+            # Set timestamp as index if not already
+            if df.index.name != 'ts_event':
+                df.set_index('timestamp', inplace=True)
+
+            return df
+
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            raise
+
+    def filter_rth(
+        self,
+        df: pd.DataFrame,
+        symbol_prefix: Optional[str] = None,
+        custom_start: Optional[time] = None,
+        custom_end: Optional[time] = None
+    ) -> pd.DataFrame:
+        """
+        Filter DataFrame to only include Regular Trading Hours (RTH)
+
+        Args:
+            df: DataFrame with datetime index
+            symbol_prefix: Symbol prefix (e.g., 'ES', 'NQ') to determine RTH hours
+            custom_start: Custom RTH start time (overrides default)
+            custom_end: Custom RTH end time (overrides default)
+
+        Returns:
+            Filtered DataFrame with only RTH data
+        """
+        if df.empty:
+            return df
+
+        # Determine RTH hours
+        if custom_start and custom_end:
+            rth_start = custom_start
+            rth_end = custom_end
+        elif symbol_prefix and symbol_prefix in self.RTH_HOURS:
+            rth_start = self.RTH_HOURS[symbol_prefix]['start']
+            rth_end = self.RTH_HOURS[symbol_prefix]['end']
+        else:
+            rth_start = self.RTH_HOURS['default']['start']
+            rth_end = self.RTH_HOURS['default']['end']
+
+        print(f"Filtering for RTH: {rth_start} to {rth_end}")
+
+        # Filter by time
+        df_rth = df.between_time(rth_start, rth_end)
+
+        print(f"RTH records: {len(df_rth)} (filtered from {len(df)})")
+
+        return df_rth
+
+    def resample_candles(
+        self,
+        df: pd.DataFrame,
+        timeframe: str = '5T'
+    ) -> pd.DataFrame:
+        """
+        Resample OHLCV data to a different timeframe
+
+        Args:
+            df: DataFrame with OHLCV data
+            timeframe: Pandas timeframe string (e.g., '1T', '3T', '5T', '15T', '1H')
+                      T = minutes, H = hours, D = days
+
+        Returns:
+            Resampled DataFrame with OHLCV data
+        """
+        if df.empty:
+            return df
+
+        print(f"Resampling to {timeframe} timeframe...")
+
+        # Define aggregation rules
+        ohlcv_dict = {
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }
+
+        # Resample
+        df_resampled = df.resample(timeframe).agg(ohlcv_dict)
+
+        # Drop rows with NaN (gaps in data)
+        df_resampled.dropna(inplace=True)
+
+        print(f"Resampled to {len(df_resampled)} candles")
+
+        return df_resampled
+
+    def plot_candlestick_matplotlib(
+        self,
+        df: pd.DataFrame,
+        title: str = "Candlestick Chart",
+        figsize: tuple = (16, 8),
+        save_path: Optional[str] = None
+    ):
+        """
+        Create a candlestick chart using matplotlib
+
+        Args:
+            df: DataFrame with OHLCV data
+            title: Chart title
+            figsize: Figure size (width, height)
+            save_path: Optional path to save the chart
+        """
+        if df.empty:
+            print("No data to plot")
+            return
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize,
+                                        gridspec_kw={'height_ratios': [3, 1]})
+
+        # Convert timestamps for matplotlib
+        timestamps = mdates.date2num(df.index.to_pydatetime())
+
+        # Plot candlesticks
+        for i, (idx, row) in enumerate(df.iterrows()):
+            timestamp = timestamps[i]
+
+            # Determine color
+            color = 'green' if row['close'] >= row['open'] else 'red'
+
+            # Draw candle body
+            body_height = abs(row['close'] - row['open'])
+            body_bottom = min(row['open'], row['close'])
+
+            rect = Rectangle(
+                (timestamp - 0.0003, body_bottom),
+                0.0006,
+                body_height,
+                facecolor=color,
+                edgecolor='black',
+                linewidth=0.5
+            )
+            ax1.add_patch(rect)
+
+            # Draw wicks
+            ax1.plot([timestamp, timestamp],
+                    [row['low'], row['high']],
+                    color='black', linewidth=0.5)
+
+        # Format x-axis
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        ax1.set_ylabel('Price')
+        ax1.set_title(title)
+        ax1.grid(True, alpha=0.3)
+        ax1.autoscale_view()
+
+        # Plot volume
+        volume_colors = ['green' if row['close'] >= row['open'] else 'red'
+                        for _, row in df.iterrows()]
+        ax2.bar(timestamps, df['volume'], color=volume_colors, width=0.0006)
+        ax2.set_ylabel('Volume')
+        ax2.set_xlabel('Time')
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        ax2.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Chart saved to {save_path}")
+
+        plt.show()
+
+    def plot_candlestick_plotly(
+        self,
+        df: pd.DataFrame,
+        title: str = "Candlestick Chart",
+        save_path: Optional[str] = None
+    ):
+        """
+        Create an interactive candlestick chart using Plotly
+
+        Args:
+            df: DataFrame with OHLCV data
+            title: Chart title
+            save_path: Optional path to save the chart as HTML
+        """
+        if df.empty:
+            print("No data to plot")
+            return
+
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            subplot_titles=(title, 'Volume'),
+            row_heights=[0.7, 0.3]
+        )
+
+        # Add candlestick chart
+        fig.add_trace(
+            go.Candlestick(
+                x=df.index,
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name='OHLC'
+            ),
+            row=1, col=1
+        )
+
+        # Add volume bars
+        colors = ['green' if row['close'] >= row['open'] else 'red'
+                 for _, row in df.iterrows()]
+
+        fig.add_trace(
+            go.Bar(
+                x=df.index,
+                y=df['volume'],
+                marker_color=colors,
+                name='Volume',
+                showlegend=False
+            ),
+            row=2, col=1
+        )
+
+        # Update layout
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            height=800,
+            showlegend=True,
+            hovermode='x unified'
+        )
+
+        fig.update_xaxes(title_text="Time", row=2, col=1)
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="Volume", row=2, col=1)
+
+        if save_path:
+            fig.write_html(save_path)
+            print(f"Interactive chart saved to {save_path}")
+
+        fig.show()
+
+    def analyze(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        timeframe: str = '5T',
+        rth_only: bool = True,
+        dataset: str = 'GLBX.MDP3',
+        plot_type: Literal['matplotlib', 'plotly', 'both'] = 'plotly',
+        save_chart: bool = False
+    ) -> pd.DataFrame:
+        """
+        Complete analysis workflow: fetch, process, and visualize market data
+
+        Args:
+            symbol: Trading symbol (e.g., 'ES.FUT', 'NQ.FUT')
+            start_date: Start date in format 'YYYY-MM-DD'
+            end_date: End date in format 'YYYY-MM-DD'
+            timeframe: Target timeframe (e.g., '1T', '3T', '5T', '15T')
+            rth_only: Filter for Regular Trading Hours only
+            dataset: Databento dataset
+            plot_type: Type of plot ('matplotlib', 'plotly', or 'both')
+            save_chart: Whether to save the chart to file
+
+        Returns:
+            Processed DataFrame with OHLCV data
+        """
+        # Fetch data
+        df = self.fetch_data(symbol, start_date, end_date, dataset=dataset)
+
+        if df.empty:
+            print("No data available for analysis")
+            return df
+
+        # Filter for RTH if requested
+        if rth_only:
+            symbol_prefix = symbol.split('.')[0]  # Extract symbol prefix
+            df = self.filter_rth(df, symbol_prefix)
+
+        # Resample to target timeframe
+        df = self.resample_candles(df, timeframe)
+
+        # Print summary statistics
+        print("\n" + "="*60)
+        print("DATA SUMMARY")
+        print("="*60)
+        print(f"Symbol: {symbol}")
+        print(f"Date Range: {start_date} to {end_date}")
+        print(f"Timeframe: {timeframe}")
+        print(f"RTH Only: {rth_only}")
+        print(f"Total Candles: {len(df)}")
+        if not df.empty:
+            print(f"Price Range: ${df['low'].min():.2f} - ${df['high'].max():.2f}")
+            print(f"Avg Volume: {df['volume'].mean():.0f}")
+        print("="*60 + "\n")
+
+        # Create visualizations
+        chart_title = f"{symbol} - {timeframe} Candles ({start_date} to {end_date})"
+
+        if plot_type in ['matplotlib', 'both']:
+            save_path = f"{symbol}_{timeframe}_matplotlib.png" if save_chart else None
+            self.plot_candlestick_matplotlib(df, title=chart_title, save_path=save_path)
+
+        if plot_type in ['plotly', 'both']:
+            save_path = f"{symbol}_{timeframe}_plotly.html" if save_chart else None
+            self.plot_candlestick_plotly(df, title=chart_title, save_path=save_path)
+
+        return df
+
+
+def main():
+    """Example usage of the Market Data Analyzer"""
+
+    # Example configuration
+    analyzer = MarketDataAnalyzer()
+
+    # Analyze E-mini S&P 500 for a specific date range
+    df = analyzer.analyze(
+        symbol='ES.FUT',
+        start_date='2025-10-20',
+        end_date='2025-10-24',
+        timeframe='5T',  # 5-minute candles
+        rth_only=True,
+        plot_type='plotly',
+        save_chart=True
+    )
+
+    # You can also save the data to CSV
+    if not df.empty:
+        output_file = 'market_data_output.csv'
+        df.to_csv(output_file)
+        print(f"Data saved to {output_file}")
+
+
+if __name__ == "__main__":
+    main()
