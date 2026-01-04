@@ -15,7 +15,9 @@ import sys
 # --- CONFIGURATION ---
 API_KEY = # will place your databento API key here
 SYMBOL = "ES.v.0"
-OUTPUT_FILE = "critical_levels_master_final.csv"
+
+# Output file - change this to compare old vs new levels
+OUTPUT_FILE = "critical_levels_master_final.csv"  # Change to "critical_levels_ENHANCED.csv" for comparison
 INPUT_FILE = "critical_levels_master_final.csv"
 TICK_SIZE = 0.25
 MIN_SINGLE_PRINT_TICKS = 8
@@ -776,15 +778,47 @@ def main():
         print("Set API Key")
         return
 
-    # --- AUTOMATION FIX: AUTO-SELECT DATES ---
+    # --- FLEXIBLE DATE SELECTION ---
+    print("Date Range Selection:")
+    print("  1. Last 5 days (quick)")
+    print("  2. Last 30 days (backtest)")
+    print("  3. Last 90 days (comprehensive)")
+    print("  4. Custom date range")
+
+    choice = input("\nSelect option [1-4, default=1]: ").strip()
+
     today = datetime.now().date()
-    start_date = today - timedelta(days=5)
-    end_date = today
+
+    if choice == "2":
+        start_date = today - timedelta(days=30)
+        end_date = today
+        print(f"   [30-DAY] Generating levels for last 30 days")
+    elif choice == "3":
+        start_date = today - timedelta(days=90)
+        end_date = today
+        print(f"   [90-DAY] Generating levels for last 90 days")
+    elif choice == "4":
+        start_input = input("Start Date (YYYY-MM-DD): ").strip()
+        end_input = input("End Date (YYYY-MM-DD, or Enter for today): ").strip()
+
+        try:
+            start_date = datetime.strptime(start_input, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_input, "%Y-%m-%d").date() if end_input else today
+            print(f"   [CUSTOM] {start_date} to {end_date}")
+        except ValueError:
+            print("Invalid date format! Using last 5 days.")
+            start_date = today - timedelta(days=5)
+            end_date = today
+    else:
+        # Default: last 5 days
+        start_date = today - timedelta(days=5)
+        end_date = today
+        print(f"   [5-DAY] Generating levels for last 5 days")
 
     start_str = start_date.strftime('%Y-%m-%d')
     end_str = end_date.strftime('%Y-%m-%d')
 
-    print(f"   [AUTO] Date Range: {start_str} to {end_str}")
+    print(f"   Date Range: {start_str} to {end_str}")
 
     master_df = load_and_clean_database(INPUT_FILE)
     if not master_df.empty:
