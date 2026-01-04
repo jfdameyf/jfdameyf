@@ -36,6 +36,7 @@ class ParameterOptimizer:
         self.end_date = end_date
         self.enable_poc_filter = enable_poc_filter
         self.results = []
+        self.shared_plans = None  # Will be set on first valid test
 
         print(f"🔬 GC PARAMETER OPTIMIZER INITIALIZED")
         print(f"   Period: {start_date} to {end_date}")
@@ -86,7 +87,7 @@ class ParameterOptimizer:
                 )
 
                 # Generate plans only once (reuse for all tests)
-                if idx == 1:
+                if self.shared_plans is None:
                     backtester.generate_historical_plans()
                     self.shared_plans = backtester.daily_plans
                 else:
