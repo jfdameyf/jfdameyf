@@ -155,6 +155,28 @@ class ParameterOptimizer:
 
                     print(f"   ✅ Trades: {total_trades}, WR: {win_rate:.1f}%, P&L: ${total_pnl*20:.0f}, Exp: ${expectancy:.0f}")
 
+                    # === ZONE & CATEGORY ANALYSIS ===
+                    print(f"   📍 ZONES:")
+                    for zone in sorted(df_trades['zone'].unique()):
+                        zone_trades = df_trades[df_trades['zone'] == zone]
+                        zone_wr = len(zone_trades[zone_trades['outcome'] == 'WIN']) / len(zone_trades) * 100
+                        zone_exp = zone_trades['pnl'].mean() * 100
+                        zone_pnl = zone_trades['pnl'].sum() * 100
+                        print(f"      Z{zone}: {len(zone_trades)}t WR={zone_wr:.0f}% Exp=${zone_exp:.0f} P&L=${zone_pnl:.0f}")
+
+                    print(f"   📊 TYPES:")
+                    for cat in sorted(df_trades['type'].unique()):
+                        cat_trades = df_trades[df_trades['type'] == cat]
+                        cat_wr = len(cat_trades[cat_trades['outcome'] == 'WIN']) / len(cat_trades) * 100
+                        cat_exp = cat_trades['pnl'].mean() * 100
+                        print(f"      {cat}: {len(cat_trades)}t WR={cat_wr:.0f}% Exp=${cat_exp:.0f}")
+
+                    scratches = df_trades[df_trades['outcome'] == 'SCRATCH']
+                    if len(scratches) > 0:
+                        scratch_avg = scratches['pnl'].mean() * 100
+                        near_target = scratches[scratches['mfe'] >= target * 0.8]
+                        print(f"   💫 SCRATCH: {len(scratches)}t Avg=${scratch_avg:.0f} | {len(near_target)} near target")
+
                 else:
                     print(f"   ⚠️ No trades generated")
 
