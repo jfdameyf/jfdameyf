@@ -450,8 +450,8 @@ def identify_and_classify_levels(df):
 
 def detect_tpo_single_prints(df):
     """ENHANCED: Now classifies tail strength - GOLD RTH HOURS"""
-    # Gold RTH: 8:20 AM - 1:30 PM ET
-    rth = df.between_time('08:20', '13:30').copy()
+    # Gold RTH: 9:30 AM - 4:15 PM ET (matching ES/NQ)
+    rth = df.between_time('09:30', '16:15').copy()
     if rth.empty: return pd.DataFrame()
     price_stats = calculate_price_stats(rth)
     tpo_periods = rth.groupby(pd.Grouper(freq='30min'))

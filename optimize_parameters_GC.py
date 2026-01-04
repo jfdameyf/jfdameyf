@@ -177,6 +177,24 @@ class ParameterOptimizer:
                         near_target = scratches[scratches['mfe'] >= target * 0.8]
                         print(f"   💫 SCRATCH: {len(scratches)}t Avg=${scratch_avg:.0f} | {len(near_target)} near target")
 
+                    # === LEVEL CATEGORY ANALYSIS ===
+                    if 'category' in df_trades.columns:
+                        print(f"   📁 CATEGORIES:")
+                        for category in sorted(df_trades['category'].unique()):
+                            cat_trades = df_trades[df_trades['category'] == category]
+                            cat_wr = len(cat_trades[cat_trades['outcome'] == 'WIN']) / len(cat_trades) * 100
+                            cat_exp = cat_trades['pnl'].mean() * 100
+                            print(f"      {category}: {len(cat_trades)}t WR={cat_wr:.0f}% Exp=${cat_exp:.0f}")
+
+                    # === LEVEL TYPE ANALYSIS ===
+                    if 'level_type' in df_trades.columns:
+                        print(f"   🏷️  LEVEL TYPES:")
+                        for ltype in sorted(df_trades['level_type'].unique()):
+                            lt_trades = df_trades[df_trades['level_type'] == ltype]
+                            lt_wr = len(lt_trades[lt_trades['outcome'] == 'WIN']) / len(lt_trades) * 100
+                            lt_exp = lt_trades['pnl'].mean() * 100
+                            print(f"      {ltype}: {len(lt_trades)}t WR={lt_wr:.0f}% Exp=${lt_exp:.0f}")
+
                 else:
                     print(f"   ⚠️ No trades generated")
 

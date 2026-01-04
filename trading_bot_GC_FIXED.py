@@ -405,7 +405,7 @@ class MarketPlanner:
             ).to_df()
             if trades.empty: raise Exception("No trade data")
             trades.index = trades.index.tz_convert(NY_TZ)
-            rth = trades.between_time('08:20', '13:30').copy()
+            rth = trades.between_time('09:30', '16:15').copy()
             rth['size'] = rth['size'].astype('int64'); rth['vol'] = rth['size']
             rth['delta'] = np.where(rth['side']=='B', rth['size'], -rth['size'])
             bars = rth.resample('1min').agg({'vol': 'sum', 'delta': 'sum'}).dropna()
@@ -442,7 +442,7 @@ class MarketPlanner:
 
         for check_date in unique_dates:
             day_slice = past_data[past_data.index.date == check_date]
-            rth_slice = day_slice.between_time('08:20', '13:30')
+            rth_slice = day_slice.between_time('09:30', '16:15')
 
             if not rth_slice.empty:
                 poc, vah, val = self.calculate_volume_profile_levels(rth_slice)

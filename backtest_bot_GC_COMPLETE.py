@@ -78,7 +78,7 @@ class TradingBotBacktester:
         print(f"   Signal Cooldown: {signal_cooldown_minutes} minutes")
         print(f"   Target: {target_points} pts | Stop: {stop_points} pts")
         print(f"   Point Value: $100/point (GC Gold)")
-        print(f"   RTH Hours: 8:20 AM - 1:30 PM ET")
+        print(f"   RTH Hours: 9:30 AM - 4:15 PM ET (matching ES/NQ)")
         print(f"   Symbol: {SYMBOL}\n")
 
     def generate_historical_plans(self):
@@ -134,9 +134,9 @@ class TradingBotBacktester:
             # Parse date
             test_date = datetime.strptime(date_str, '%Y-%m-%d').date()
 
-            # ✅ FIX: Strict RTH hours (8:20 AM - 1:30 PM ET - Gold Pit Session)
-            start_dt = NY_TZ.localize(datetime.combine(test_date, time(8, 20)))
-            end_dt = NY_TZ.localize(datetime.combine(test_date, time(13, 30)))
+            # ✅ EXTENDED: RTH hours (9:30 AM - 4:15 PM ET - matching ES/NQ)
+            start_dt = NY_TZ.localize(datetime.combine(test_date, time(9, 30)))
+            end_dt = NY_TZ.localize(datetime.combine(test_date, time(16, 15)))
 
             try:
                 # Fetch minute bars for RTH session
@@ -154,7 +154,7 @@ class TradingBotBacktester:
                     continue
 
                 # ✅ FIX: Verify all bars are within RTH
-                bars = bars.between_time('08:20', '13:30')
+                bars = bars.between_time('09:30', '16:15')
 
                 if bars.empty:
                     print(f"   ⚠️ No RTH data")
@@ -173,11 +173,11 @@ class TradingBotBacktester:
                     tick_count += 1
                     current_price = bar['close']
 
-                    # ✅ ADDITIONAL CHECK: Verify timestamp is within RTH (Gold: 8:20 AM - 1:30 PM)
+                    # ✅ ADDITIONAL CHECK: Verify timestamp is within RTH (9:30 AM - 4:15 PM)
                     hour = timestamp.hour
                     minute = timestamp.minute
 
-                    if not ((hour == 8 and minute >= 20) or (9 <= hour < 13) or (hour == 13 and minute <= 30)):
+                    if not ((hour == 9 and minute >= 30) or (10 <= hour < 16) or (hour == 16 and minute <= 15)):
                         continue  # Skip non-RTH bars
 
                     # Check all levels for signals
@@ -298,7 +298,9 @@ class TradingBotBacktester:
                 'entry_price': current_price,  # Actual fill price
                 'zone': zone,
                 'size_mod': modifier,
-                'message': message
+                'message': message,
+                'category': level.get('category', 'UNKNOWN'),
+                'level_type': level.get('level_type', 'UNKNOWN')
             }
 
         elif action == "RECAPTURE_ENTRY":
@@ -310,7 +312,9 @@ class TradingBotBacktester:
                 'entry_price': current_price,
                 'zone': zone,
                 'size_mod': modifier,
-                'message': message
+                'message': message,
+                'category': level.get('category', 'UNKNOWN'),
+                'level_type': level.get('level_type', 'UNKNOWN')
             }
 
         # Record signal time
@@ -450,6 +454,8 @@ class TradingBotBacktester:
             'direction': direction,
             'type': signal['type'],
             'zone': signal['zone'],
+            'category': signal.get('category', 'UNKNOWN'),
+            'level_type': signal.get('level_type', 'UNKNOWN'),
             'mfe': round(mfe, 2),
             'mae': round(mae, 2),
             'pnl': round(pnl, 2),
