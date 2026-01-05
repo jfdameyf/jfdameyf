@@ -25,7 +25,7 @@ API_KEY = # will place your databento API key here
 SYMBOL = "GC.c.0"
 
 # Output file
-OUTPUT_FILE = "critical_levels_master_enhanced_GC.csv"
+OUTPUT_FILE = "critical_levels_GC_master.csv"
 INPUT_FILE = "critical_levels_master_enhanced_GC.csv"
 TICK_SIZE = 0.10  # Gold: 10 cents per tick
 MIN_SINGLE_PRINT_TICKS = 10  # Adjusted for smaller tick size
