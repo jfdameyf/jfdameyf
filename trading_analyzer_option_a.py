@@ -1679,6 +1679,225 @@ def generate_session_chart(df: pd.DataFrame, analysis_state: PatternAnalysisStat
 
 
 # --- 14. INTERACTIVE LOOP (OPTION A VERSION) ---
+
+def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
+                                   date_obj: datetime.date, tz: pytz.timezone,
+                                   ai_brain: TradeClassifier,
+                                   analysis_state: PatternAnalysisState,
+                                   session_ctx: SessionContext,
+                                   session_state: Dict):
+    """
+    Batch processing with labels: Analyze all patterns first, then compare to user labels.
+
+    Input format examples:
+    - "9:30, high of day; 9:31, sell impulse; 10:42-10:49, consolidation"
+    - "[9:30, high of day], [9:31, sell impulse], [10:42-10:49, consolidation]"
+
+    The script analyzes all times FIRST without seeing labels,
+    then compares predictions vs user labels.
+    """
+    print("\n" + "="*80)
+    print("BATCH PROCESSING MODE - Analyzing patterns before checking labels...")
+    print("="*80)
+
+    # Parse input - handle both ; and , as separators between pairs
+    # First try to split by semicolon or ], then by commas within each pair
+    if ';' in user_input:
+        raw_pairs = [x.strip() for x in user_input.split(';')]
+    else:
+        # Try to detect ], [ pattern for array-style input
+        if '],' in user_input or '] ,' in user_input:
+            user_input = user_input.replace('[', '').replace(']', '')
+            raw_pairs = [x.strip() for x in user_input.split(',') if x.strip()]
+            # Re-pair them (every 2 items = 1 pair)
+            temp_pairs = []
+            for i in range(0, len(raw_pairs), 2):
+                if i+1 < len(raw_pairs):
+                    temp_pairs.append(f"{raw_pairs[i]}, {raw_pairs[i+1]}")
+            raw_pairs = temp_pairs
+        else:
+            # Assume format: "time, label, time, label, ..."
+            # We need to pair them up
+            all_items = [x.strip() for x in user_input.split(',')]
+            raw_pairs = []
+            for i in range(0, len(all_items), 2):
+                if i+1 < len(all_items):
+                    raw_pairs.append(f"{all_items[i]}, {all_items[i+1]}")
+
+    # Parse each pair into (time_str, label)
+    time_label_pairs = []
+    for pair in raw_pairs:
+        if not pair.strip():
+            continue
+
+        # Split by last comma to separate time from label
+        parts = pair.rsplit(',', 1)
+        if len(parts) != 2:
+            print(f"[WARN] Skipping invalid pair (need 'time, label'): {pair}")
+            continue
+
+        time_str = parts[0].strip()
+        label_str = parts[1].strip().upper()
+
+        time_label_pairs.append((time_str, label_str))
+
+    if not time_label_pairs:
+        print("[ERROR] No valid time,label pairs found")
+        print("Expected format: '9:30, high of day; 9:31, sell impulse; 10:42-10:49, consolidation'")
+        return
+
+    print(f"\n[INFO] Found {len(time_label_pairs)} time,label pairs")
+    print(f"[INFO] Analyzing all patterns first (labels hidden)...\n")
+
+    # STEP 1: Analyze all patterns WITHOUT looking at user labels
+    results = []
+    for time_str, user_label in time_label_pairs:
+        try:
+            # Parse time/range (same logic as original function)
+            if '-' in time_str and ':' in time_str.split('-')[0] and ':' in time_str.split('-')[1]:
+                # Explicit range
+                t1_str, t2_str = time_str.split('-')
+                ts_start = tz.localize(datetime.combine(
+                    date_obj, datetime.strptime(t1_str.strip(), '%H:%M').time()
+                ))
+                ts_end = tz.localize(datetime.combine(
+                    date_obj, datetime.strptime(t2_str.strip(), '%H:%M').time()
+                ))
+                center_ts = ts_start + (ts_end - ts_start) / 2
+                is_explicit_range = True
+            else:
+                # Single time
+                center_ts = tz.localize(datetime.combine(
+                    date_obj, datetime.strptime(time_str.strip(), '%H:%M').time()
+                ))
+
+                # Calculate adaptive window
+                window_size = calculate_adaptive_window(df, center_ts)
+                ts_start = center_ts - timedelta(minutes=window_size)
+                ts_end = center_ts + timedelta(minutes=window_size)
+                is_explicit_range = False
+
+            # Slice data
+            pre_df = df[(df.index >= ts_start - timedelta(minutes=PRE_EVENT_LOOKBACK_MINUTES)) &
+                       (df.index < ts_start)]
+            event_df = df[(df.index >= ts_start) & (df.index <= ts_end)]
+            post_df = df[df.index > ts_end]
+
+            if event_df.empty:
+                print(f"[WARN] No data for {time_str}, skipping")
+                continue
+
+            # Validate
+            validate_data(event_df)
+
+            # Calculate metrics
+            stats_df, totals = calculate_granular_metrics(event_df)
+            if stats_df is None:
+                print(f"[WARN] No metrics for {time_str}, skipping")
+                continue
+
+            # Extract features
+            feats = extract_features(pre_df, event_df, post_df, totals,
+                                    session_ctx, analysis_state, center_ts, session_state)
+            high_px, low_px = event_df['price'].max(), event_df['price'].min()
+            close_px = event_df['price'].iloc[-1]
+            open_px = event_df['price'].iloc[0]
+            duration = feats['duration_mins']
+
+            # GET PREDICTIONS (without seeing user label!)
+            session_high = df['price'].max()
+            session_low = df['price'].min()
+            heuristic_label = heuristic_classify(feats, high_px, low_px, close_px, open_px,
+                                                duration, session_high, session_low)
+            ml_label, confidence = ai_brain.predict_with_confidence(feats)
+
+            # Decide prediction
+            if ml_label and confidence > 0.5:
+                predicted_label = ml_label
+                source = f"ML ({confidence:.1%})"
+            else:
+                predicted_label = heuristic_label
+                source = "Heuristic"
+
+            # Store result (user label is NOT used yet)
+            results.append({
+                'time_str': time_str,
+                'center_ts': center_ts,
+                'ts_start': ts_start,
+                'ts_end': ts_end,
+                'is_explicit_range': is_explicit_range,
+                'predicted_label': predicted_label,
+                'user_label': user_label,
+                'source': source,
+                'confidence': confidence if ml_label else 0.0,
+                'features': feats,
+                'high_px': high_px,
+                'low_px': low_px,
+                'range_pts': high_px - low_px,
+                'duration': duration,
+                'totals': totals
+            })
+
+        except Exception as e:
+            print(f"[ERROR] Failed to analyze {time_str}: {e}")
+            continue
+
+    if not results:
+        print("[ERROR] No patterns successfully analyzed")
+        return
+
+    # STEP 2: Compare predictions vs user labels and display
+    print("\n" + "="*80)
+    print("COMPARISON: Predictions vs Your Labels")
+    print("="*80)
+    print(f"{'Time':<15} {'Predicted':<30} {'Your Label':<30} {'Match':<8} {'Source':<15}")
+    print("-"*110)
+
+    matches = 0
+    mismatches = 0
+
+    for result in results:
+        # Normalize labels for comparison (case-insensitive)
+        pred_norm = result['predicted_label'].upper().replace(' ', '')
+        user_norm = result['user_label'].upper().replace(' ', '')
+
+        match = pred_norm == user_norm
+        match_str = "✓ YES" if match else "✗ NO"
+
+        if match:
+            matches += 1
+        else:
+            mismatches += 1
+
+        print(f"{result['time_str']:<15} {result['predicted_label']:<30} {result['user_label']:<30} {match_str:<8} {result['source']:<15}")
+
+    print("-"*110)
+    print(f"Summary: {matches} matches, {mismatches} mismatches ({matches/(matches+mismatches)*100:.1f}% accuracy)")
+    print("="*80)
+
+    # STEP 3: Save all to training data (using USER labels as ground truth)
+    print(f"\n[INFO] Saving {len(results)} patterns to training data...")
+
+    for result in results:
+        # Get parent pattern if exists
+        parent_label = analysis_state.get_parent_label(result['time_str'])
+
+        # Save with USER's label (ground truth)
+        ai_brain.save_example(result['features'], result['user_label'], parent_pattern=parent_label)
+
+        # Add to analysis state
+        analysis_state.add_pattern(result['time_str'], result['center_ts'], result['user_label'],
+                                   result['features'], (result['ts_start'], result['ts_end']))
+
+        # If consolidation with explicit range, add as container
+        if result['user_label'].upper().replace(' ', '') == "CONSOLIDATION" and result['is_explicit_range']:
+            analysis_state.add_consolidation_range(result['ts_start'], result['ts_end'],
+                                                   result['high_px'], result['low_px'])
+
+    print(f"[OK] Batch processing complete! {len(results)} patterns saved.")
+    print(f"[OK] Model will retrain with new examples.")
+
+
 def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                              date_obj: datetime.date, tz: pytz.timezone,
                              ai_brain: TradeClassifier,
@@ -1832,14 +2051,21 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                 elif user_conf == 'n':
                     print("\nSelect Correct Label:")
                     options = [
-                        "HOD",
-                        "LOD",
-                        "REVERSAL",
-                        "FALSE REVERSAL",
-                        "CONTINUATION",
-                        "PULLBACK CONTINUATION",
-                        "CONSOLIDATION",
-                        "IMPULSE MOVE"
+                        "HIGH OF DAY",
+                        "LOW OF DAY",
+                        "BUY REVERSAL",
+                        "SELL REVERSAL",
+                        "FALSE BUY REVERSAL",
+                        "FALSE SELL REVERSAL",
+                        "PULLBACK BUY REVERSAL",
+                        "PULLBACK SELL REVERSAL",
+                        "PULLBACK BUY CONTINUATION",
+                        "PULLBACK SELL CONTINUATION",
+                        "BUY CONTINUATION",
+                        "SELL CONTINUATION",
+                        "BUY IMPULSE",
+                        "SELL IMPULSE",
+                        "CONSOLIDATION"
                     ]
                     for i, opt in enumerate(options):
                         print(f" {i+1}. {opt}")
@@ -1941,10 +2167,14 @@ def main():
 
     # Interactive loop
     print("\nEnter times to analyze:")
-    print("  Examples:")
-    print("    - Single time (adaptive window): 09:30")
-    print("    - Explicit range: 11:00-11:45")
+    print("  STANDARD MODE (interactive):")
+    print("    - Single time: 09:30")
     print("    - Multiple: 09:30, 11:00-12:00, 14:15")
+    print("")
+    print("  BATCH MODE (with labels - faster!):")
+    print("    - Format: 9:30, high of day; 9:31, sell impulse; 10:42-10:49, consolidation")
+    print("    - Script analyzes ALL patterns first, then compares to your labels")
+    print("")
     print("  Type 'q' to quit")
     print("  Type 'seq' to view ML-learned sequences")
 
@@ -1963,7 +2193,28 @@ def main():
             if not u_in:
                 continue
 
-            parse_and_process_inputs(u_in, df, d_obj, tz, brain, analysis_state, session_ctx, session_state)
+            # Detect batch mode: check if input contains pattern names
+            # Look for any of the 15 pattern names in the input
+            pattern_keywords = [
+                'high of day', 'low of day', 'hod', 'lod',
+                'buy reversal', 'sell reversal',
+                'false buy reversal', 'false sell reversal',
+                'pullback buy reversal', 'pullback sell reversal',
+                'pullback buy continuation', 'pullback sell continuation',
+                'buy continuation', 'sell continuation',
+                'buy impulse', 'sell impulse',
+                'consolidation', 'reversal', 'continuation', 'impulse'
+            ]
+
+            input_lower = u_in.lower()
+            is_batch_mode = any(keyword in input_lower for keyword in pattern_keywords)
+
+            if is_batch_mode:
+                # Batch mode: parse time,label pairs
+                parse_batch_inputs_with_labels(u_in, df, d_obj, tz, brain, analysis_state, session_ctx, session_state)
+            else:
+                # Standard interactive mode
+                parse_and_process_inputs(u_in, df, d_obj, tz, brain, analysis_state, session_ctx, session_state)
 
             # Retrain if needed
             if SKLEARN_AVAILABLE and brain.needs_retraining:
