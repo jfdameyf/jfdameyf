@@ -2,15 +2,22 @@
 Trading Pattern Classifier - OPTION A (33 Features)
 
 SEQUENCE LEARNING + INCREMENTAL + CONSOLIDATION CONTEXT VERSION:
-- 8 Pattern Types (refined taxonomy):
-  1. HOD (High of Day) - Actual session high (may or may not be significant reversal)
-  2. LOD (Low of Day) - Actual session low (may or may not be significant reversal)
-  3. REVERSAL - Significant magnitude move away from area that holds
-  4. FALSE REVERSAL - Insufficient magnitude OR fails to hold (often traps traders)
-  5. CONTINUATION - Continues after impulse/reversal started (NOT from consolidation)
-  6. PULLBACK CONTINUATION - Opposite-color pullback then resumes trend
-  7. CONSOLIDATION - Sideways, range-bound, low volatility
-  8. IMPULSE MOVE - Explosive directional move (from consolidation OR v-shape)
+- 15 Pattern Types (directional taxonomy with buy/sell splits):
+  1. HIGH OF DAY - RTH session high (volatility depends on timing)
+  2. LOW OF DAY - RTH session low (volatility depends on timing)
+  3. BUY REVERSAL - Significant low (10+ pts ES, 20+ pts NQ), holds 15+ mins
+  4. SELL REVERSAL - Significant high (10+ pts ES, 20+ pts NQ), holds 15+ mins
+  5. FALSE BUY REVERSAL - Shallow bounce (5-10 pts ES, 10-20 pts NQ), fakeout
+  6. FALSE SELL REVERSAL - Shallow pullback (5-10 pts ES, 10-20 pts NQ), fakeout
+  7. PULLBACK BUY REVERSAL - After false sell reversal, resumes buying
+  8. PULLBACK SELL REVERSAL - After false buy reversal, resumes selling
+  9. PULLBACK BUY CONTINUATION - After pullback buy reversal, indicates breakout
+  10. PULLBACK SELL CONTINUATION - After pullback sell reversal, indicates breakdown
+  11. BUY CONTINUATION - Makes higher high, closes above previous
+  12. SELL CONTINUATION - Makes lower low, closes below previous
+  13. BUY IMPULSE - Large green candle/wick, high volume, explosive upward
+  14. SELL IMPULSE - Large red candle/wick, high volume, explosive downward
+  15. CONSOLIDATION - Choppy, many false reversals, range-bound
 
 - 33 ML Features enabling automatic sequence discovery + solving overlapping windows:
   * 12 Base Features (Volume Profile + Price Velocity + Delta/Volume Analysis)
@@ -29,13 +36,18 @@ SEQUENCE LEARNING + INCREMENTAL + CONSOLIDATION CONTEXT VERSION:
 - Session Visualization (auto-generated chart for cross-reference)
 
 KEY IMPROVEMENTS:
-1. HOD/LOD separated from reversals (day extremes != significant reversals)
-2. REVERSAL redefined (significant magnitude that holds, not just day's extreme)
-3. FALSE REVERSAL clarified (traps traders, insufficient magnitude or fails)
-4. IMPULSE MOVE added (explosive moves from consolidation or v-shapes)
-5. INCREMENTAL FEATURES solve overlapping window problem (9:49 vs 9:50 now distinct!)
-6. CONSOLIDATION CONTEXT enables learning breakout patterns automatically
-7. ML learns sequences like "CONSOLIDATION → IMPULSE → FALSE REVERSAL → PULLBACK"
+1. DIRECTIONAL PATTERNS - All patterns now have buy/sell directional splits (15 vs 8)
+2. INSTRUMENT-SPECIFIC THRESHOLDS - ES (10pt) vs NQ (20pt) reversal thresholds
+3. SEQUENCE-AWARE CLASSIFICATION - Detects patterns based on previous pattern context
+4. HOD/LOD separated from reversals (day extremes != significant reversals)
+5. BUY/SELL REVERSALS - Significant moves (10+ pts ES, 20+ pts NQ), must hold 15+ mins
+6. FALSE REVERSALS - Shallow fakeouts (5-10 pts ES, 10-20 pts NQ), often in consolidation
+7. PULLBACK SEQUENCE - FALSE REVERSAL → PULLBACK REVERSAL → PULLBACK CONTINUATION
+8. IMPULSE PATTERNS - Large candles/wicks with high volume, explosive moves
+9. CONTINUATIONS - Make higher high/lower low, directionally consistent
+10. INCREMENTAL FEATURES solve overlapping window problem (9:49 vs 9:50 now distinct!)
+11. CONSOLIDATION CONTEXT enables learning breakout patterns automatically
+12. ML learns sequences like "FALSE SELL → PULLBACK BUY REVERSAL → PULLBACK BUY CONTINUATION"
 
 The ML model learns which sequences matter through context features, enabling discovery of
 patterns like "Gap-up near prev day high → IMPULSE → FALSE REVERSAL → PULLBACK → REVERSAL"
@@ -131,6 +143,21 @@ MAX_WINDOW_MINUTES = 15
 
 # Separation Parameters
 MIN_SEPARATION_MINUTES = 0  # Allow close-together patterns (incremental features handle this)
+
+# Pattern Detection Thresholds (instrument-specific)
+# Detect instrument from SYMBOL
+IS_ES = "ES" in SYMBOL.upper()
+IS_NQ = "NQ" in SYMBOL.upper()
+
+# Reversal thresholds: Price must move this far before opposite reversal
+REVERSAL_THRESHOLD = 10.0 if IS_ES else 20.0  # ES: 10pts, NQ: 20pts
+
+# False reversal thresholds: Shallow moves that typically reverse
+FALSE_REVERSAL_MIN = 5.0 if IS_ES else 10.0   # ES: 5pts, NQ: 10pts
+FALSE_REVERSAL_MAX = 10.0 if IS_ES else 20.0  # ES: 10pts, NQ: 20pts
+
+# Minimum time before reversal can be broken (otherwise it's false reversal)
+REVERSAL_HOLD_TIME_MINUTES = 15
 
 # ML Parameters
 RF_N_ESTIMATORS = 100
@@ -920,14 +947,21 @@ class TradeClassifier:
         ]
 
         self.labels_map = [
-            "HOD",  # High of Day
-            "LOD",  # Low of Day
-            "REVERSAL",
-            "FALSE REVERSAL",
-            "CONTINUATION",
-            "PULLBACK CONTINUATION",
-            "CONSOLIDATION",
-            "IMPULSE MOVE"
+            "HIGH OF DAY",           # 1: Session high (RTH)
+            "LOW OF DAY",            # 2: Session low (RTH)
+            "BUY REVERSAL",          # 3: Significant low, moves 10+ pts (ES) or 20+ pts (NQ)
+            "SELL REVERSAL",         # 4: Significant high, moves 10+ pts (ES) or 20+ pts (NQ)
+            "FALSE BUY REVERSAL",    # 5: Shallow bounce 5-10 pts (ES) or 10-20 pts (NQ)
+            "FALSE SELL REVERSAL",   # 6: Shallow pullback 5-10 pts (ES) or 10-20 pts (NQ)
+            "PULLBACK BUY REVERSAL", # 7: After false sell reversal, resumes buying
+            "PULLBACK SELL REVERSAL",# 8: After false buy reversal, resumes selling
+            "PULLBACK BUY CONTINUATION",  # 9: After pullback buy reversal, breakout
+            "PULLBACK SELL CONTINUATION", # 10: After pullback sell reversal, breakdown
+            "BUY CONTINUATION",      # 11: Makes higher high, closes above previous
+            "SELL CONTINUATION",     # 12: Makes lower low, closes below previous
+            "BUY IMPULSE",           # 13: Large green candle or large wick, high volume
+            "SELL IMPULSE",          # 14: Large red candle or large wick, high volume
+            "CONSOLIDATION"          # 15: Choppy period with many false reversals
         ]
 
     def load_model(self) -> bool:
@@ -1003,7 +1037,7 @@ class TradeClassifier:
             train_score = self.model.score(X_train, y_train)
             test_score = self.model.score(X_test, y_test)
 
-            print(f"[ML] Option A model trained on {len(df)} examples (33 features, 8 patterns)")
+            print(f"[ML] Option A model trained on {len(df)} examples (33 features, 15 patterns)")
             print(f"     Training accuracy: {train_score:.1%}")
             print(f"     Testing accuracy:  {test_score:.1%}")
 
@@ -1094,21 +1128,23 @@ class TradeClassifier:
             print(f"[ML] Failed to save example: {e}")
 
 
-# --- 11. HEURISTIC LOGIC (NEW TAXONOMY) ---
-def heuristic_classify(features: Dict, high_px: float, low_px: float,
-                       duration: float, session_high: float, session_low: float) -> str:
+# --- 11. HEURISTIC LOGIC (NEW 15-PATTERN TAXONOMY) ---
+def heuristic_classify(features: Dict, high_px: float, low_px: float, close_px: float,
+                       open_px: float, duration: float, session_high: float, session_low: float) -> str:
     """
-    Rule-based classification with new 8-pattern taxonomy.
+    Rule-based classification with new 15-pattern directional taxonomy.
 
     Pattern Definitions:
-    - HOD/LOD: Actual session extremes (may not be significant reversals)
-    - REVERSAL: Significant magnitude move away from area that holds
-    - FALSE REVERSAL: Insufficient magnitude OR fails to hold
-    - CONTINUATION: Continues after impulse/reversal started (NOT from consolidation)
-    - PULLBACK CONTINUATION: Opposite-color pullback then resumes
-    - CONSOLIDATION: Sideways, low volatility
-    - IMPULSE MOVE: Explosive move from consolidation OR v-shape
+    - HIGH/LOW OF DAY: RTH extremes (volatility depends on when made)
+    - BUY/SELL REVERSAL: Significant moves (10+ pts ES, 20+ pts NQ), holds 15+ mins
+    - FALSE BUY/SELL REVERSAL: Shallow (5-10 pts ES, 10-20 pts NQ), often in consolidation
+    - PULLBACK BUY/SELL REVERSAL: After false reversal opposite direction, resumes trend
+    - PULLBACK BUY/SELL CONTINUATION: After pullback reversal, indicates breakout/breakdown
+    - BUY/SELL CONTINUATION: Makes higher high/lower low, closes above/below previous
+    - BUY/SELL IMPULSE: Large candles/wicks, high volume, explosive moves
+    - CONSOLIDATION: Choppy, many false reversals
     """
+    # Extract features
     trend = features['trend']
     color = features['color']
     broken_high = features['broken_high']
@@ -1116,102 +1152,135 @@ def heuristic_classify(features: Dict, high_px: float, low_px: float,
     range_pts = high_px - low_px
     velocity = abs(features.get('price_velocity', 0))
     max_velocity = abs(features.get('max_velocity', 0))
+    total_vol = features.get('total_vol', 0)
 
-    # Check if this is session high or low (within 0.25 pts)
+    # Previous pattern context
+    prev_pattern_1 = features.get('previous_pattern_1', 0)
+
+    # Decode previous patterns (from pattern_label_encoder)
+    # FALSE BUY REVERSAL = 5, FALSE SELL REVERSAL = 6
+    # PULLBACK BUY REVERSAL = 7, PULLBACK SELL REVERSAL = 8
+    prev_was_false_sell = prev_pattern_1 == 6
+    prev_was_false_buy = prev_pattern_1 == 5
+    prev_was_pullback_buy_reversal = prev_pattern_1 == 7
+    prev_was_pullback_sell_reversal = prev_pattern_1 == 8
+
+    # Check if session high or low (within 0.25 pts)
     is_session_high = abs(high_px - session_high) < 0.25
     is_session_low = abs(low_px - session_low) < 0.25
 
+    # 1. HIGH OF DAY / LOW OF DAY (session extremes)
     if is_session_high:
-        return "HOD"
+        return "HIGH OF DAY"
     elif is_session_low:
-        return "LOD"
+        return "LOW OF DAY"
 
-    # Consolidation check (low range, longer duration)
+    # 2. CONSOLIDATION (low range, longer duration, choppy)
     if duration >= CONSOLIDATION_MIN_DURATION and range_pts < CONSOLIDATION_RANGE_THRESHOLD:
         return "CONSOLIDATION"
 
-    # IMPULSE MOVE: High velocity from consolidation OR v-shape
-    # V-shape: Large range, short duration, high velocity
+    # 3. IMPULSE CANDLES (large candles, large wicks, high volume, explosive moves)
+    is_large_range = range_pts > 5.0
+    is_high_volume = total_vol > 5000  # Threshold (can adjust)
     is_high_velocity = velocity > 5.0 or max_velocity > 8.0
-    is_from_consolidation = trend == 0  # No prior trend = coming from consolidation
-    is_v_shape = range_pts > 3.0 and duration < 3.0 and is_high_velocity
 
-    if is_high_velocity and (is_from_consolidation or is_v_shape):
-        return "IMPULSE MOVE"
+    # Large wick detection
+    upper_wick = high_px - max(open_px, close_px)
+    lower_wick = min(open_px, close_px) - low_px
+    has_large_wick = upper_wick > 2.0 or lower_wick > 2.0
 
-    # Check if previous pattern was a false reversal (indicates pullback that failed)
-    previous_was_false_reversal = features.get('previous_pattern_1', 0) == 4  # FALSE REVERSAL = 4
+    # Impulse: (large range + high volume) OR (large wick + high volume) OR high velocity
+    is_impulse = (is_large_range and is_high_volume) or (has_large_wick and is_high_volume) or (is_high_velocity and range_pts > 3.0)
 
-    # UPTREND PATTERNS
+    if is_impulse:
+        if color == 1:  # Green
+            return "BUY IMPULSE"
+        else:  # Red
+            return "SELL IMPULSE"
+
+    # 4. UPTREND PATTERNS (trend == 1)
     if trend == 1:
-        if color == 1:  # Green (same as trend)
-            # Check if this is continuation AFTER a false reversal (pullback that failed)
-            # User's interpretation: 6005→6015 after 6010→6005 pullback
-            if previous_was_false_reversal and broken_low == 0:
-                return "PULLBACK CONTINUATION"  # Continuing up after pullback failed
-            elif broken_low == 0:
-                return "CONTINUATION"  # Normal continuation
-            else:
-                # Broke low = false reversal (failed to hold)
-                return "FALSE REVERSAL"
+        if color == 1:  # Green candle (same direction as trend)
+            # PULLBACK BUY CONTINUATION: After pullback buy reversal, indicates breakout
+            if prev_was_pullback_buy_reversal:
+                return "PULLBACK BUY CONTINUATION"
 
-        elif color == -1:  # Red (pullback in uptrend)
-            # User's interpretation: 6010→6005 pullback = FALSE REVERSAL
-            # The CLOSE being lower is what makes it a false reversal
-            if broken_high == 1:
-                # Breaks back above later = pullback failed to hold
-                return "FALSE REVERSAL"
-            elif broken_high == 0 and broken_low == 0:
-                # Holds without breaking either direction
-                # Check magnitude to distinguish REVERSAL from FALSE REVERSAL
-                if range_pts > 2.0:  # Significant magnitude
-                    return "REVERSAL"
-                else:
-                    return "FALSE REVERSAL"  # Small pullback that holds
-            else:
-                # Broke low = continued down, failed as pullback
-                return "FALSE REVERSAL"
+            # PULLBACK BUY REVERSAL: After false sell reversal, resumes buying
+            # "No other red candles should occur immediately following"
+            elif prev_was_false_sell:
+                return "PULLBACK BUY REVERSAL"
 
-    # DOWNTREND PATTERNS
+            # BUY CONTINUATION: Makes higher high, closes above previous
+            elif broken_low == 0:  # Didn't break low, continuing up
+                return "BUY CONTINUATION"
+
+            else:
+                # Broke low - failed continuation
+                return "FALSE BUY REVERSAL"
+
+        else:  # color == -1, Red candle (pullback in uptrend)
+            # Pullback in uptrend - check magnitude
+            if FALSE_REVERSAL_MIN <= range_pts <= FALSE_REVERSAL_MAX:
+                # Shallow pullback (5-10 pts ES, 10-20 pts NQ)
+                return "FALSE SELL REVERSAL"
+            elif range_pts > REVERSAL_THRESHOLD:
+                # Significant sell-off (10+ pts ES, 20+ pts NQ)
+                return "SELL REVERSAL"
+            else:
+                # Very small, default to false reversal
+                return "FALSE SELL REVERSAL"
+
+    # 5. DOWNTREND PATTERNS (trend == -1)
     elif trend == -1:
-        if color == -1:  # Red (same as trend)
-            # Check if this is continuation AFTER a false reversal (bounce that failed)
-            if previous_was_false_reversal and broken_high == 0:
-                return "PULLBACK CONTINUATION"  # Continuing down after bounce failed
-            elif broken_high == 0:
-                return "CONTINUATION"  # Normal continuation
+        if color == -1:  # Red candle (same direction as trend)
+            # PULLBACK SELL CONTINUATION: After pullback sell reversal, indicates breakdown
+            if prev_was_pullback_sell_reversal:
+                return "PULLBACK SELL CONTINUATION"
+
+            # PULLBACK SELL REVERSAL: After false buy reversal, resumes selling
+            # "No other green candles should occur immediately following"
+            elif prev_was_false_buy:
+                return "PULLBACK SELL REVERSAL"
+
+            # SELL CONTINUATION: Makes lower low, closes below previous
+            elif broken_high == 0:  # Didn't break high, continuing down
+                return "SELL CONTINUATION"
+
             else:
-                # Broke high = false reversal (failed to hold)
-                return "FALSE REVERSAL"
+                # Broke high - failed continuation
+                return "FALSE SELL REVERSAL"
 
-        elif color == 1:  # Green (bounce in downtrend)
-            # Bounce in downtrend = FALSE REVERSAL
-            # The CLOSE being higher is what makes it a false reversal
-            if broken_low == 1:
-                # Breaks back below later = bounce failed to hold
-                return "FALSE REVERSAL"
-            elif broken_low == 0 and broken_high == 0:
-                # Holds without breaking either direction
-                # Check magnitude to distinguish REVERSAL from FALSE REVERSAL
-                if range_pts > 2.0:  # Significant magnitude
-                    return "REVERSAL"
-                else:
-                    return "FALSE REVERSAL"  # Small bounce that holds
+        else:  # color == 1, Green candle (bounce in downtrend)
+            # Bounce in downtrend - check magnitude
+            if FALSE_REVERSAL_MIN <= range_pts <= FALSE_REVERSAL_MAX:
+                # Shallow bounce (5-10 pts ES, 10-20 pts NQ)
+                return "FALSE BUY REVERSAL"
+            elif range_pts > REVERSAL_THRESHOLD:
+                # Significant bounce (10+ pts ES, 20+ pts NQ)
+                return "BUY REVERSAL"
             else:
-                # Broke high = continued up, failed as bounce
-                return "FALSE REVERSAL"
+                # Very small, default to false reversal
+                return "FALSE BUY REVERSAL"
 
-    # No clear trend - check for impulse or consolidation
-    if is_high_velocity and range_pts > 2.0:
-        return "IMPULSE MOVE"
-    elif range_pts < CONSOLIDATION_RANGE_THRESHOLD:
-        return "CONSOLIDATION"
-
-    # Default: if significant range, call it reversal
-    if range_pts > 2.0:
-        return "REVERSAL"
-
-    return "CONSOLIDATION"
+    # 6. NO CLEAR TREND (trend == 0 or neutral)
+    else:
+        # Check magnitude for reversal classification
+        if color == 1:  # Green candle
+            if range_pts > REVERSAL_THRESHOLD:
+                return "BUY REVERSAL"
+            elif FALSE_REVERSAL_MIN <= range_pts <= FALSE_REVERSAL_MAX:
+                return "FALSE BUY REVERSAL"
+            else:
+                # Too small or in consolidation
+                return "CONSOLIDATION"
+        else:  # Red candle
+            if range_pts > REVERSAL_THRESHOLD:
+                return "SELL REVERSAL"
+            elif FALSE_REVERSAL_MIN <= range_pts <= FALSE_REVERSAL_MAX:
+                return "FALSE SELL REVERSAL"
+            else:
+                # Too small or in consolidation
+                return "CONSOLIDATION"
 
 
 # --- 12. PATTERN ANALYSIS STATE (ENHANCED FOR SEQUENCE LEARNING) ---
@@ -1223,14 +1292,21 @@ class PatternAnalysisState:
         self.analyzed_times = []  # List of datetimes
         self.consolidation_ranges = []  # List of consolidation containers
         self.pattern_label_encoder = {
-            "HOD": 1,
-            "LOD": 2,
-            "REVERSAL": 3,
-            "FALSE REVERSAL": 4,
-            "CONTINUATION": 5,
-            "PULLBACK CONTINUATION": 6,
-            "CONSOLIDATION": 7,
-            "IMPULSE MOVE": 8
+            "HIGH OF DAY": 1,
+            "LOW OF DAY": 2,
+            "BUY REVERSAL": 3,
+            "SELL REVERSAL": 4,
+            "FALSE BUY REVERSAL": 5,
+            "FALSE SELL REVERSAL": 6,
+            "PULLBACK BUY REVERSAL": 7,
+            "PULLBACK SELL REVERSAL": 8,
+            "PULLBACK BUY CONTINUATION": 9,
+            "PULLBACK SELL CONTINUATION": 10,
+            "BUY CONTINUATION": 11,
+            "SELL CONTINUATION": 12,
+            "BUY IMPULSE": 13,
+            "SELL IMPULSE": 14,
+            "CONSOLIDATION": 15
         }
 
     def encode_pattern_label(self, label: str) -> int:
@@ -1672,14 +1748,16 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
             feats = extract_features(pre_df, event_df, post_df, totals,
                                     session_ctx, analysis_state, center_ts, session_state)
             high_px, low_px = event_df['price'].max(), event_df['price'].min()
+            close_px = event_df['price'].iloc[-1]  # Last price in window
+            open_px = event_df['price'].iloc[0]    # First price in window
             duration = feats['duration_mins']
 
             # GET PREDICTIONS
             # Calculate session high/low for HOD/LOD detection
             session_high = df['price'].max()
             session_low = df['price'].min()
-            heuristic_label = heuristic_classify(feats, high_px, low_px, duration,
-                                                session_high, session_low)
+            heuristic_label = heuristic_classify(feats, high_px, low_px, close_px, open_px,
+                                                duration, session_high, session_low)
             ml_label, confidence = ai_brain.predict_with_confidence(feats)
 
             # Decide what to show
@@ -1810,7 +1888,7 @@ def main():
     """Main entry point."""
     print("="*80)
     print("Trading Pattern Classifier - OPTION A (33 FEATURES)")
-    print("8 Patterns | 33 Features | Sequence + Incremental + Consolidation Context")
+    print("15 Patterns | 33 Features | Sequence + Incremental + Consolidation Context")
     print("="*80)
 
     # Initialize AI
