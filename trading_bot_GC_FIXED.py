@@ -672,8 +672,7 @@ class LiveBot:
                 print()
             else:
                 print("⚠️  WARNING: No plan available for new day!")
-                print("   Run MarketPlanner to generate today's plan!
-")
+                print("   Run MarketPlanner to generate today's plan!\n")
 
 
         scan_range = 20.0  # GC: 20pts (ES was 20pts - 1x scaling, NQ was 80pts)
