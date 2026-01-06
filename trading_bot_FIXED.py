@@ -827,20 +827,17 @@ class LiveBot:
                     print(f"\n🔍 Record {self.tick_count + 1}:")
                     print(f"   Type: {type(record)}")
                     print(f"   Has 'price': {hasattr(record, 'price')}")
-                    print(f"   Has 'hd': {hasattr(record, 'hd')}")
                     if hasattr(record, 'price'):
                         print(f"   Raw price: {record.price}")
-                    print(f"   Dir: {[attr for attr in dir(record) if not attr.startswith('_')][:10]}")
 
-                if hasattr(record, 'price') and hasattr(record, 'hd'):
-                    # ✅ FIX: Correct price conversion for Databento
-                    # Check if price is already converted (schema dependent)
+                # ✅ FIX: Only check for price attribute (TradeMsg doesn't have 'hd')
+                if hasattr(record, 'price') and record.price > 0:
                     # For GLBX.MDP3 trades, price is in fixed-point with 9 decimal precision
                     price = record.price / 1e9  # Convert from fixed-point
 
                     # Debug first few prices to verify
-                    if self.tick_count < 5:
-                        print(f"✅ VALID TRADE: Raw={record.price}, Converted={price:.2f}")
+                    if self.tick_count < 10:
+                        print(f"   ✅ PROCESSING: Raw={record.price}, Converted={price:.2f}\n")
 
                     self.tick_count += 1
                     self.evaluate_market(price)
@@ -849,8 +846,8 @@ class LiveBot:
                     if (datetime.now() - self.last_status_time).seconds >= 300:
                         self.print_bot_status()
                         self.last_status_time = datetime.now()
-                elif self.tick_count < 10:
-                    print(f"   ⚠️ Skipped (missing price or hd)")
+                elif self.tick_count < 10 and hasattr(record, 'price'):
+                    print(f"   ⚠️ Skipped (price={record.price})\n")
                     self.tick_count += 1
 
         except KeyboardInterrupt:
