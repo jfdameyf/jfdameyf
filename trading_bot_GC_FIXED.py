@@ -593,6 +593,23 @@ class LiveBot:
         self.last_status_time = datetime.now()
         self.current_trading_day = datetime.now(NY_TZ).date()  # Track current day for reload
 
+        # ✅ FIX: Validate plan is for today's date
+        if self.strategy.context:
+            plan_date_str = self.strategy.context.get('timestamp', '')
+            if plan_date_str:
+                try:
+                    plan_date = datetime.strptime(plan_date_str.split()[0], '%Y-%m-%d').date()
+                    if plan_date != self.current_trading_day:
+                        print(f"\n{'='*60}")
+                        print(f"⚠️  WARNING: STALE PLAN DETECTED!")
+                        print(f"   Plan Date: {plan_date}")
+                        print(f"   Today's Date: {self.current_trading_day}")
+                        print(f"   >>> RUN MARKET PLANNER FOR TODAY FIRST! <<<")
+                        print(f"{'='*60}\n")
+                        # Don't exit - allow user to decide, but make it very clear
+                except:
+                    pass  # If we can't parse date, continue anyway
+
     def print_bot_status(self):
         """Print diagnostic status"""
         print("\n" + "="*60)
