@@ -822,6 +822,16 @@ class LiveBot:
             )
 
             for record in self.live_client:
+                # Enhanced debugging for first 10 records
+                if self.tick_count < 10:
+                    print(f"\n🔍 Record {self.tick_count + 1}:")
+                    print(f"   Type: {type(record)}")
+                    print(f"   Has 'price': {hasattr(record, 'price')}")
+                    print(f"   Has 'hd': {hasattr(record, 'hd')}")
+                    if hasattr(record, 'price'):
+                        print(f"   Raw price: {record.price}")
+                    print(f"   Dir: {[attr for attr in dir(record) if not attr.startswith('_')][:10]}")
+
                 if hasattr(record, 'price') and hasattr(record, 'hd'):
                     # ✅ FIX: Correct price conversion for Databento
                     # Check if price is already converted (schema dependent)
@@ -830,7 +840,7 @@ class LiveBot:
 
                     # Debug first few prices to verify
                     if self.tick_count < 5:
-                        print(f"DEBUG: Raw price: {record.price}, Converted: {price:.2f}")
+                        print(f"✅ VALID TRADE: Raw={record.price}, Converted={price:.2f}")
 
                     self.tick_count += 1
                     self.evaluate_market(price)
@@ -839,6 +849,9 @@ class LiveBot:
                     if (datetime.now() - self.last_status_time).seconds >= 300:
                         self.print_bot_status()
                         self.last_status_time = datetime.now()
+                elif self.tick_count < 10:
+                    print(f"   ⚠️ Skipped (missing price or hd)")
+                    self.tick_count += 1
 
         except KeyboardInterrupt:
             print("\n🛑 Bot Stopped.")
