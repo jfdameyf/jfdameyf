@@ -643,13 +643,11 @@ class LiveBot:
         today = datetime.now(NY_TZ).date()
 
         if today != self.current_trading_day:
-            print(f"
-{'='*60}")
+            print(f"\n{'='*60}")
             print(f"🌅 NEW TRADING DAY DETECTED: {today}")
             print(f"   Previous: {self.current_trading_day}")
             print(f"   Reloading daily plan and clearing state...")
-            print(f"{'='*60}
-")
+            print(f"{'='*60}\n")
 
             # Reload context for new day
             self.strategy.context = self.strategy.load_latest_context()
