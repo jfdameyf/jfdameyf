@@ -590,6 +590,7 @@ class LiveBot:
         self.active_signals = {}  # Time-based deduplication
         self.live_client = db.Live(API_KEY)
         self.tick_count = 0
+        self.last_price = None  # Track for delta calculation
         self.last_status_time = datetime.now()
         self.current_trading_day = datetime.now(NY_TZ).date()  # Track current day for reload
 
@@ -770,23 +771,24 @@ class LiveBot:
             )
 
             for record in self.live_client:
-                # Enhanced debugging for first 10 records
-                if self.tick_count < 10:
-                    print(f"\n🔍 Record {self.tick_count + 1}:")
-                    print(f"   Type: {type(record)}")
-                    print(f"   Has 'price': {hasattr(record, 'price')}")
-                    if hasattr(record, 'price'):
-                        print(f"   Raw price: {record.price}")
-
-                # ✅ FIX: Only check for price attribute (TradeMsg doesn't have 'hd')
+                # Only process trade messages with valid prices
                 if hasattr(record, 'price') and record.price > 0:
                     # For GLBX.MDP3 trades, price is in fixed-point with 9 decimal precision
                     price = record.price / 1e9  # Convert from fixed-point
+                    current_time = datetime.now(NY_TZ).strftime('%H:%M:%S')
 
-                    # Debug first few prices to verify
-                    if self.tick_count < 10:
-                        print(f"   ✅ PROCESSING: Raw={record.price}, Converted={price:.2f}\n")
+                    # Calculate delta from last price
+                    delta = 0.0
+                    if self.last_price is not None:
+                        delta = price - self.last_price
 
+                    # Show first 30 ticks to verify continuous stream
+                    if self.tick_count < 30:
+                        delta_str = f"{delta:+.2f}" if self.last_price is not None else "  --  "
+                        print(f"[{current_time}] Price: {price:.2f}  |  Δ: {delta_str}")
+
+                    # Update tracking
+                    self.last_price = price
                     self.tick_count += 1
                     self.evaluate_market(price)
 
@@ -794,9 +796,6 @@ class LiveBot:
                     if (datetime.now() - self.last_status_time).seconds >= 300:
                         self.print_bot_status()
                         self.last_status_time = datetime.now()
-                elif self.tick_count < 10 and hasattr(record, 'price'):
-                    print(f"   ⚠️ Skipped (price={record.price})\n")
-                    self.tick_count += 1
 
         except KeyboardInterrupt:
             print("\n🛑 GC Bot Stopped.")
