@@ -21,8 +21,8 @@ import logging
 # ⚙️ CONFIGURATION
 # ==============================================================================
 
-API_KEY = # will place your databento API key here
-DISCORD_WEBHOOK_URL = # will place your discord webhook url here
+API_KEY = ""  # will place your databento API key here
+DISCORD_WEBHOOK_URL = ""  # will place your discord webhook url here
 
 # --- STRATEGY SETTINGS ---
 ENABLE_POC_FILTER = False
@@ -785,7 +785,6 @@ class LiveBot:
                     if (datetime.now() - self.last_status_time).seconds >= 300:
                         self.print_bot_status()
                         self.last_status_time = datetime.now()
-        self.current_trading_day = datetime.now(NY_TZ).date()  # Track current day for reload
 
         except KeyboardInterrupt:
             print("\n🛑 NQ Bot Stopped.")

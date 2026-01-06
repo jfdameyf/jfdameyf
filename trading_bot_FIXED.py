@@ -20,8 +20,8 @@ import logging
 # ==============================================================================
 
 # ⚠️ ACTION REQUIRED: Replace with your actual key
-API_KEY = # will place your databento API key here
-DISCORD_WEBHOOK_URL = # will place your discord webhook url here
+API_KEY = ""  # will place your databento API key here
+DISCORD_WEBHOOK_URL = ""  # will place your discord webhook url here
 
 # --- STRATEGY SETTINGS ---
 # Set to False to disable the "Danger Zone" (>50pts) filter
