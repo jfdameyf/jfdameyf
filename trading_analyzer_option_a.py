@@ -159,6 +159,30 @@ FALSE_REVERSAL_MAX = 10.0 if IS_ES else 20.0  # ES: 10pts, NQ: 20pts
 # Minimum time before reversal can be broken (otherwise it's false reversal)
 REVERSAL_HOLD_TIME_MINUTES = 15
 
+# Objective Pattern Classification Thresholds (data-driven)
+# These make the heuristic more objective and less subjective
+
+# Volume thresholds (adjust based on typical volumes for your instrument)
+IMPULSE_MIN_VOLUME = 5000        # Minimum volume for impulse classification
+IMPULSE_MIN_RANGE = 5.0          # Minimum range (pts) for impulse
+CONTINUATION_MIN_VOLUME = 2000   # Minimum volume for strong continuation
+
+# Delta imbalance thresholds (measures buying vs selling pressure)
+STRONG_BUY_DELTA_THRESHOLD = 0.6    # 60%+ buying = strong buy pressure
+STRONG_SELL_DELTA_THRESHOLD = -0.6  # 60%+ selling = strong sell pressure
+WEAK_DELTA_THRESHOLD = 0.2          # <20% imbalance = weak/unclear
+
+# Velocity thresholds (price movement speed)
+IMPULSE_MIN_VELOCITY = 5.0       # pts/min minimum for impulse
+HIGH_VELOCITY_THRESHOLD_V2 = 8.0 # pts/min for very fast moves
+
+# Volume profile thresholds (where volume traded in range)
+UPPER_VOLUME_BIAS_THRESHOLD = 0.65  # 65%+ volume in upper half = buying
+LOWER_VOLUME_BIAS_THRESHOLD = 0.35  # 35%- volume in upper half = selling
+
+# Absorption thresholds
+HIGH_ABSORPTION_THRESHOLD = 3.0  # High absorption ratio indicates strong absorption
+
 # ML Parameters
 RF_N_ESTIMATORS = 100
 RF_RANDOM_STATE = 42
@@ -1154,6 +1178,19 @@ def heuristic_classify(features: Dict, high_px: float, low_px: float, close_px: 
     max_velocity = abs(features.get('max_velocity', 0))
     total_vol = features.get('total_vol', 0)
 
+    # OBJECTIVE DATA: Delta, volume profile, absorption
+    delta_imbalance = features.get('delta_imbalance', 0)
+    upper_volume_pct = features.get('upper_volume_pct', 0.5)
+    absorption_ratio = features.get('absorption_ratio', 0)
+
+    # Determine objective directional bias from data
+    has_strong_buy_pressure = delta_imbalance > STRONG_BUY_DELTA_THRESHOLD
+    has_strong_sell_pressure = delta_imbalance < STRONG_SELL_DELTA_THRESHOLD
+    has_weak_pressure = abs(delta_imbalance) < WEAK_DELTA_THRESHOLD
+
+    has_upper_volume_bias = upper_volume_pct > UPPER_VOLUME_BIAS_THRESHOLD
+    has_lower_volume_bias = upper_volume_pct < LOWER_VOLUME_BIAS_THRESHOLD
+
     # Previous pattern context
     prev_pattern_1 = features.get('previous_pattern_1', 0)
 
@@ -1179,24 +1216,48 @@ def heuristic_classify(features: Dict, high_px: float, low_px: float, close_px: 
     if duration >= CONSOLIDATION_MIN_DURATION and range_pts < CONSOLIDATION_RANGE_THRESHOLD:
         return "CONSOLIDATION"
 
-    # 3. IMPULSE CANDLES (large candles, large wicks, high volume, explosive moves)
-    is_large_range = range_pts > 5.0
-    is_high_volume = total_vol > 5000  # Threshold (can adjust)
-    is_high_velocity = velocity > 5.0 or max_velocity > 8.0
+    # 3. IMPULSE CANDLES (OBJECTIVE: large candles, large wicks, high volume, explosive moves)
+    # Use stricter objective thresholds
+    is_large_range = range_pts > IMPULSE_MIN_RANGE
+    is_high_volume = total_vol > IMPULSE_MIN_VOLUME
+    is_high_velocity = velocity > IMPULSE_MIN_VELOCITY or max_velocity > HIGH_VELOCITY_THRESHOLD_V2
 
     # Large wick detection
     upper_wick = high_px - max(open_px, close_px)
     lower_wick = min(open_px, close_px) - low_px
     has_large_wick = upper_wick > 2.0 or lower_wick > 2.0
 
-    # Impulse: (large range + high volume) OR (large wick + high volume) OR high velocity
+    # Impulse detection with OBJECTIVE validation using delta/volume profile
     is_impulse = (is_large_range and is_high_volume) or (has_large_wick and is_high_volume) or (is_high_velocity and range_pts > 3.0)
 
     if is_impulse:
-        if color == 1:  # Green
-            return "BUY IMPULSE"
-        else:  # Red
-            return "SELL IMPULSE"
+        # OBJECTIVE VALIDATION: Check if delta/volume profile supports the direction
+        if color == 1:  # Green candle
+            # For BUY impulse, expect strong buy pressure and/or upper volume bias
+            if has_strong_buy_pressure or has_upper_volume_bias:
+                return "BUY IMPULSE"  # Data confirms buying pressure
+            elif has_strong_sell_pressure and has_lower_volume_bias:
+                # Data contradicts - might be absorption/trap
+                # Demote to continuation or check further
+                if broken_low == 0:
+                    return "BUY CONTINUATION"  # Less confident
+                else:
+                    return "FALSE BUY REVERSAL"
+            else:
+                return "BUY IMPULSE"  # Neutral data, trust price action
+
+        else:  # Red candle
+            # For SELL impulse, expect strong sell pressure and/or lower volume bias
+            if has_strong_sell_pressure or has_lower_volume_bias:
+                return "SELL IMPULSE"  # Data confirms selling pressure
+            elif has_strong_buy_pressure and has_upper_volume_bias:
+                # Data contradicts - might be absorption/trap
+                if broken_high == 0:
+                    return "SELL CONTINUATION"  # Less confident
+                else:
+                    return "FALSE SELL REVERSAL"
+            else:
+                return "SELL IMPULSE"  # Neutral data, trust price action
 
     # 4. UPTREND PATTERNS (trend == 1)
     if trend == 1:
@@ -1680,6 +1741,118 @@ def generate_session_chart(df: pd.DataFrame, analysis_state: PatternAnalysisStat
 
 # --- 14. INTERACTIVE LOOP (OPTION A VERSION) ---
 
+def analyze_pattern_similarity(pred_label: str, true_label: str) -> dict:
+    """
+    Analyze pattern similarity at multiple levels.
+
+    Returns:
+    - directional_match: Same direction (BUY vs SELL) - CRITICAL
+    - category_match: Same category (REVERSAL, CONTINUATION, IMPULSE, FALSE_REVERSAL)
+    - exact_match: Exact pattern match
+    - similarity_score: 0.0 to 1.0 (weighted)
+    - error_severity: 'CRITICAL', 'MODERATE', 'MINOR', or 'NONE'
+    """
+    # Normalize labels
+    pred = pred_label.upper().replace('_', ' ')
+    true = true_label.upper().replace('_', ' ')
+
+    # Exact match
+    if pred == true:
+        return {
+            'directional_match': True,
+            'category_match': True,
+            'exact_match': True,
+            'similarity_score': 1.0,
+            'error_severity': 'NONE'
+        }
+
+    # Extract components
+    def extract_components(label):
+        """Extract direction, category, and modifiers from label."""
+        label = label.upper()
+
+        # Direction
+        direction = None
+        if 'BUY' in label:
+            direction = 'BUY'
+        elif 'SELL' in label:
+            direction = 'SELL'
+        elif 'HIGH OF DAY' in label or 'HOD' in label:
+            direction = 'SELL'  # High = potential sell area
+        elif 'LOW OF DAY' in label or 'LOD' in label:
+            direction = 'BUY'   # Low = potential buy area
+        else:
+            direction = 'NEUTRAL'
+
+        # Category
+        category = None
+        if 'IMPULSE' in label:
+            category = 'IMPULSE'
+        elif 'FALSE' in label and 'REVERSAL' in label:
+            category = 'FALSE_REVERSAL'
+        elif 'REVERSAL' in label:
+            category = 'REVERSAL'
+        elif 'CONTINUATION' in label:
+            category = 'CONTINUATION'
+        elif 'CONSOLIDATION' in label:
+            category = 'CONSOLIDATION'
+        elif 'HIGH OF DAY' in label or 'HOD' in label:
+            category = 'SESSION_EXTREME'
+        elif 'LOW OF DAY' in label or 'LOD' in label:
+            category = 'SESSION_EXTREME'
+
+        # Modifiers
+        is_pullback = 'PULLBACK' in label
+
+        return {
+            'direction': direction,
+            'category': category,
+            'is_pullback': is_pullback
+        }
+
+    pred_comp = extract_components(pred)
+    true_comp = extract_components(true)
+
+    # Check directional match (MOST CRITICAL)
+    directional_match = pred_comp['direction'] == true_comp['direction']
+
+    # Check category match
+    category_match = pred_comp['category'] == true_comp['category']
+
+    # Calculate similarity score (weighted)
+    score = 0.0
+
+    # Direction is 50% of score (most important)
+    if directional_match:
+        score += 0.5
+
+    # Category is 30% of score
+    if category_match:
+        score += 0.3
+
+    # Pullback modifier is 20% of score
+    if pred_comp['is_pullback'] == true_comp['is_pullback']:
+        score += 0.2
+
+    # Determine error severity
+    if not directional_match:
+        error_severity = 'CRITICAL'  # Wrong direction = disaster
+    elif not category_match:
+        error_severity = 'MODERATE'  # Wrong category but right direction
+    else:
+        error_severity = 'MINOR'     # Same direction and category, just modifiers differ
+
+    return {
+        'directional_match': directional_match,
+        'category_match': category_match,
+        'exact_match': False,
+        'similarity_score': score,
+        'error_severity': error_severity,
+        'pred_components': pred_comp,
+        'true_components': true_comp
+    }
+
+
 def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
                                    date_obj: datetime.date, tz: pytz.timezone,
                                    ai_brain: TradeClassifier,
@@ -1846,33 +2019,82 @@ def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
         print("[ERROR] No patterns successfully analyzed")
         return
 
-    # STEP 2: Compare predictions vs user labels and display
+    # STEP 2: Compare predictions vs user labels with HIERARCHICAL ANALYSIS
     print("\n" + "="*80)
-    print("COMPARISON: Predictions vs Your Labels")
+    print("COMPARISON: Predictions vs Your Labels (Hierarchical Analysis)")
     print("="*80)
-    print(f"{'Time':<15} {'Predicted':<30} {'Your Label':<30} {'Match':<8} {'Source':<15}")
-    print("-"*110)
+    print(f"{'Time':<12} {'Predicted':<25} {'Your Label':<25} {'Dir':<5} {'Cat':<5} {'Exact':<6} {'Severity':<10}")
+    print("-"*105)
 
-    matches = 0
-    mismatches = 0
+    # Track multi-level accuracy
+    exact_matches = 0
+    directional_matches = 0
+    category_matches = 0
+    critical_errors = 0
+    moderate_errors = 0
+    minor_errors = 0
 
     for result in results:
-        # Normalize labels for comparison (case-insensitive)
-        pred_norm = result['predicted_label'].upper().replace(' ', '')
-        user_norm = result['user_label'].upper().replace(' ', '')
+        # Analyze similarity
+        similarity = analyze_pattern_similarity(result['predicted_label'], result['user_label'])
 
-        match = pred_norm == user_norm
-        match_str = "✓ YES" if match else "✗ NO"
+        # Track stats
+        if similarity['exact_match']:
+            exact_matches += 1
+        if similarity['directional_match']:
+            directional_matches += 1
+        if similarity['category_match']:
+            category_matches += 1
 
-        if match:
-            matches += 1
+        if similarity['error_severity'] == 'CRITICAL':
+            critical_errors += 1
+        elif similarity['error_severity'] == 'MODERATE':
+            moderate_errors += 1
+        elif similarity['error_severity'] == 'MINOR':
+            minor_errors += 1
+
+        # Format display
+        dir_symbol = "✓" if similarity['directional_match'] else "✗"
+        cat_symbol = "✓" if similarity['category_match'] else "✗"
+        exact_symbol = "✓" if similarity['exact_match'] else "✗"
+
+        # Color code severity (using text markers)
+        if similarity['error_severity'] == 'CRITICAL':
+            severity_str = "🔴 CRIT"
+        elif similarity['error_severity'] == 'MODERATE':
+            severity_str = "🟡 MOD"
+        elif similarity['error_severity'] == 'MINOR':
+            severity_str = "🟢 MINOR"
         else:
-            mismatches += 1
+            severity_str = "✅ NONE"
 
-        print(f"{result['time_str']:<15} {result['predicted_label']:<30} {result['user_label']:<30} {match_str:<8} {result['source']:<15}")
+        print(f"{result['time_str']:<12} {result['predicted_label']:<25} {result['user_label']:<25} "
+              f"{dir_symbol:<5} {cat_symbol:<5} {exact_symbol:<6} {severity_str:<10}")
 
-    print("-"*110)
-    print(f"Summary: {matches} matches, {mismatches} mismatches ({matches/(matches+mismatches)*100:.1f}% accuracy)")
+    print("-"*105)
+    print("\n" + "="*80)
+    print("HIERARCHICAL ACCURACY BREAKDOWN")
+    print("="*80)
+    print(f"✅ EXACT MATCH:       {exact_matches}/{len(results)} ({exact_matches/len(results)*100:.1f}%)")
+    print(f"   ↳ Every detail correct\n")
+    print(f"🎯 DIRECTIONAL:       {directional_matches}/{len(results)} ({directional_matches/len(results)*100:.1f}%)  ⭐ MOST IMPORTANT")
+    print(f"   ↳ Correct BUY vs SELL direction\n")
+    print(f"📊 CATEGORY:          {category_matches}/{len(results)} ({category_matches/len(results)*100:.1f}%)")
+    print(f"   ↳ Correct pattern type (REVERSAL, CONTINUATION, IMPULSE, etc.)\n")
+
+    print("-"*80)
+    print("ERROR SEVERITY ANALYSIS")
+    print("-"*80)
+    print(f"🔴 CRITICAL errors:   {critical_errors}  (Wrong direction - BUY vs SELL)")
+    print(f"🟡 MODERATE errors:   {moderate_errors}  (Right direction, wrong category)")
+    print(f"🟢 MINOR errors:      {minor_errors}  (Right direction & category, wrong modifier)")
+    print("="*80)
+
+    # Calculate weighted score
+    weighted_score = (exact_matches * 1.0 + (directional_matches - exact_matches) * 0.5 +
+                     (category_matches - exact_matches) * 0.3) / len(results)
+    print(f"\n💡 WEIGHTED SCORE: {weighted_score*100:.1f}% (50% direction + 30% category + 20% exact)")
+    print(f"   This score reflects that directional errors are MUCH worse than fine distinctions.")
     print("="*80)
 
     # STEP 3: Save all to training data (using USER labels as ground truth)
