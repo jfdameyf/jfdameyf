@@ -837,62 +837,92 @@ class ReportGenerator:
         self.analyzer = analyzer
         self.insights = insights
         self.name = analyzer.name
+        self._lines: List[str] = []
 
-    def print_header(self, title: str, char: str = '=', width: int = 70):
-        print(f"\n{char * width}")
-        print(f"  {title}")
-        print(f"{char * width}")
+    def _add(self, text: str = ""):
+        """Add a line to the report buffer."""
+        self._lines.append(text)
 
-    def print_section(self, title: str):
-        print(f"\n{'─' * 50}")
-        print(f"  {title}")
-        print(f"{'─' * 50}")
+    def _header(self, title: str, char: str = '=', width: int = 70):
+        """Add a header section."""
+        self._add("")
+        self._add(char * width)
+        self._add(f"  {title}")
+        self._add(char * width)
 
-    def generate_full_report(self, results_df: pd.DataFrame):
-        """Generate comprehensive analysis report."""
+    def _section(self, title: str):
+        """Add a section divider."""
+        self._add("")
+        self._add("─" * 50)
+        self._add(f"  {title}")
+        self._add("─" * 50)
 
-        self.print_header(f"LEVEL ANALYSIS REPORT: {self.name}")
+    def _get_report(self) -> str:
+        """Get the full report as a string."""
+        return "\n".join(self._lines)
 
-        print(f"\nConfig: Touch={self.analyzer.config['touch_buffer']}, "
-              f"Break={self.analyzer.config['break_threshold']}, "
-              f"Hold={self.analyzer.config['hold_min_move']}")
+    def _clear(self):
+        """Clear the report buffer."""
+        self._lines = []
+
+    def _output(self, output_file: str = None) -> str:
+        """Print to console and optionally save to file. Returns report text."""
+        report_text = self._get_report()
+        print(report_text)
+
+        if output_file:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(report_text)
+            logger.info(f"Report saved to {output_file}")
+
+        return report_text
+
+    def generate_full_report(self, results_df: pd.DataFrame, output_file: str = None) -> str:
+        """Generate comprehensive analysis report. Returns report text."""
+        self._clear()
+
+        self._header(f"LEVEL ANALYSIS REPORT: {self.name}")
+
+        self._add(f"\nConfig: Touch={self.analyzer.config['touch_buffer']}, "
+                  f"Break={self.analyzer.config['break_threshold']}, "
+                  f"Hold={self.analyzer.config['hold_min_move']}")
 
         # Overall Statistics
-        self.print_section("OVERALL STATISTICS")
+        self._section("OVERALL STATISTICS")
         total = len(results_df)
         touched = len(results_df[results_df['outcome'] != 'UNTOUCHED'])
         held = len(results_df[results_df['outcome'] == 'HELD'])
         broken = len(results_df[results_df['outcome'] == 'BROKEN'])
 
-        print(f"  Total Levels: {total}")
-        print(f"  Touched: {touched} ({touched/total*100:.1f}%)")
+        self._add(f"  Total Levels: {total}")
+        self._add(f"  Touched: {touched} ({touched/total*100:.1f}%)")
         if touched > 0:
-            print(f"  Held: {held} ({held/touched*100:.1f}% of touched)")
-            print(f"  Broken: {broken} ({broken/touched*100:.1f}% of touched)")
+            self._add(f"  Held: {held} ({held/touched*100:.1f}% of touched)")
+            self._add(f"  Broken: {broken} ({broken/touched*100:.1f}% of touched)")
 
         # Category Performance
-        self.print_section("PERFORMANCE BY CATEGORY")
+        self._section("PERFORMANCE BY CATEGORY")
         cat_perf = self.insights.get_category_performance()
         if not cat_perf.empty:
-            print(cat_perf.to_string())
+            self._add(cat_perf.to_string())
         else:
-            print("  No data available")
+            self._add("  No data available")
 
         # Zone Performance
-        self.print_section("PERFORMANCE BY ZONE")
+        self._section("PERFORMANCE BY ZONE")
         zone_perf = self.insights.get_zone_performance()
         if not zone_perf.empty:
-            print(zone_perf.to_string())
+            self._add(zone_perf.to_string())
         else:
-            print("  No data available")
+            self._add("  No data available")
 
         # Time of Day Analysis
-        self.print_section("TIME OF DAY ANALYSIS (Hour of First Touch)")
+        self._section("TIME OF DAY ANALYSIS (Hour of First Touch)")
         tod = self.insights.get_time_of_day_analysis()
         if not tod.empty:
-            print(tod.to_string())
+            self._add(tod.to_string())
         else:
-            print("  No data available")
+            self._add("  No data available")
 
         # Timeframe breakdowns
         for tf in ['current_week', 'previous_week', 'last_n_days']:
@@ -901,89 +931,95 @@ class ReportGenerator:
                 continue
 
             tf_label = tf.upper().replace('_', ' ')
-            self.print_section(f"{tf_label} ({len(dates)} days: {dates[0]} to {dates[-1]})")
+            self._section(f"{tf_label} ({len(dates)} days: {dates[0]} to {dates[-1]})")
 
             tf_df = results_df[results_df['date'].isin(dates)]
             if tf_df.empty:
-                print("  No data")
+                self._add("  No data")
                 continue
 
-            touched = tf_df[tf_df['outcome'] != 'UNTOUCHED']
-            if len(touched) > 0:
-                held = len(touched[touched['outcome'] == 'HELD'])
-                broken = len(touched[touched['outcome'] == 'BROKEN'])
-                print(f"  Tested: {len(touched)} | Held: {held} ({held/len(touched)*100:.0f}%) | Broken: {broken}")
+            touched_df = tf_df[tf_df['outcome'] != 'UNTOUCHED']
+            if len(touched_df) > 0:
+                held = len(touched_df[touched_df['outcome'] == 'HELD'])
+                broken = len(touched_df[touched_df['outcome'] == 'BROKEN'])
+                self._add(f"  Tested: {len(touched_df)} | Held: {held} ({held/len(touched_df)*100:.0f}%) | Broken: {broken}")
 
             # Recurring levels
             recurring = self.insights.get_recurring_levels(dates)
             if not recurring.empty:
-                print("\n  Recurring Levels (2+ occurrences):")
-                print(recurring.head(5).to_string())
+                self._add("\n  Recurring Levels (2+ occurrences):")
+                self._add(recurring.head(5).to_string())
 
-    def generate_next_day_report(self, next_day_date: str = None):
-        """Generate actionable report for next trading day."""
+        return self._output(output_file)
 
-        self.print_header(f"NEXT DAY TRADING LEVELS: {self.name}", char='*')
+    def generate_next_day_report(self, next_day_date: str = None, output_file: str = None) -> str:
+        """Generate actionable report for next trading day. Returns report text."""
+        self._clear()
+
+        self._header(f"NEXT DAY TRADING LEVELS: {self.name}", char='*')
 
         # Find next day's plan
         if next_day_date is None:
             dates = list(self.analyzer.context_data.keys())
             if not dates:
-                print("No context data available")
-                return
+                self._add("No context data available")
+                return self._output(output_file)
             next_day_date = dates[-1]
 
         if next_day_date not in self.analyzer.context_data:
-            print(f"No plan found for {next_day_date}")
-            return
+            self._add(f"No plan found for {next_day_date}")
+            return self._output(output_file)
 
         plan = self.analyzer.context_data[next_day_date]
         scored = self.insights.generate_next_day_levels(plan)
 
-        print(f"\n  Date: {next_day_date}")
-        print(f"  Current Price: {scored.get('current_price', 'N/A')}")
-        print(f"  Predicted Range: {scored.get('predicted_range', 'N/A'):.1f} pts")
+        self._add(f"\n  Date: {next_day_date}")
+        self._add(f"  Current Price: {scored.get('current_price', 'N/A')}")
+        pred_range = scored.get('predicted_range')
+        self._add(f"  Predicted Range: {pred_range:.1f} pts" if pred_range else "  Predicted Range: N/A")
 
         # Top Resistance Levels
-        self.print_section("TOP RESISTANCE LEVELS (Ranked by Historical Performance)")
+        self._section("TOP RESISTANCE LEVELS (Ranked by Historical Performance)")
         for i, lvl in enumerate(scored.get('top_resistance', []), 1):
-            print(f"  {i}. {lvl['price']:.2f} | {lvl['category']} | {lvl['zone']} | "
-                  f"Score: {lvl.get('score_composite', 0):.0f} | "
-                  f"Hist Hold: {lvl.get('historical_hold_rate', 0):.0f}%")
+            self._add(f"  {i}. {lvl['price']:.2f} | {lvl['category']} | {lvl['zone']} | "
+                      f"Score: {lvl.get('score_composite', 0):.0f} | "
+                      f"Hist Hold: {lvl.get('historical_hold_rate', 0):.0f}%")
 
         # Top Support Levels
-        self.print_section("TOP SUPPORT LEVELS (Ranked by Historical Performance)")
+        self._section("TOP SUPPORT LEVELS (Ranked by Historical Performance)")
         for i, lvl in enumerate(scored.get('top_support', []), 1):
-            print(f"  {i}. {lvl['price']:.2f} | {lvl['category']} | {lvl['zone']} | "
-                  f"Score: {lvl.get('score_composite', 0):.0f} | "
-                  f"Hist Hold: {lvl.get('historical_hold_rate', 0):.0f}%")
+            self._add(f"  {i}. {lvl['price']:.2f} | {lvl['category']} | {lvl['zone']} | "
+                      f"Score: {lvl.get('score_composite', 0):.0f} | "
+                      f"Hist Hold: {lvl.get('historical_hold_rate', 0):.0f}%")
 
         # Confluence Zones
         confluence = scored.get('confluence_zones', [])
         if confluence:
-            self.print_section("CONFLUENCE ZONES (Multiple Levels Clustered)")
+            self._section("CONFLUENCE ZONES (Multiple Levels Clustered)")
             for i, zone in enumerate(confluence[:3], 1):
                 sw_flag = " [SUPER_WALL]" if zone['has_super_wall'] else ""
-                print(f"  {i}. {zone['price_low']:.2f} - {zone['price_high']:.2f} | "
-                      f"{zone['count']} levels{sw_flag}")
+                self._add(f"  {i}. {zone['price_low']:.2f} - {zone['price_high']:.2f} | "
+                          f"{zone['count']} levels{sw_flag}")
 
         # Trading Notes
-        self.print_section("TRADING NOTES")
+        self._section("TRADING NOTES")
 
         # Identify best category historically
         cat_perf = self.insights.get_category_performance()
         if not cat_perf.empty and 'Hold_Rate%' in cat_perf.columns:
             best_cat = cat_perf['Hold_Rate%'].idxmax()
             best_rate = cat_perf.loc[best_cat, 'Hold_Rate%']
-            print(f"  - Best performing category: {best_cat} ({best_rate:.0f}% hold rate)")
+            self._add(f"  - Best performing category: {best_cat} ({best_rate:.0f}% hold rate)")
 
         # Zone 1 alert
         zone_perf = self.insights.get_zone_performance()
         if not zone_perf.empty and 'Zone 1' in zone_perf.index:
             z1_rate = zone_perf.loc['Zone 1', 'Hold_Rate%']
-            print(f"  - Zone 1 historical hold rate: {z1_rate:.0f}%")
+            self._add(f"  - Zone 1 historical hold rate: {z1_rate:.0f}%")
 
-        print(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._add(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        return self._output(output_file)
 
 
 # ==============================================================================
@@ -1064,12 +1100,17 @@ def main():
         # Generate insights
         insights = TradingInsights(analyzer, results_df)
 
-        # Generate reports
+        # Generate reports (print to console and save to files)
         reporter = ReportGenerator(analyzer, insights)
-        reporter.generate_full_report(results_df)
-        reporter.generate_next_day_report()
+        reporter.generate_full_report(
+            results_df,
+            output_file=f"{instrument_name.lower()}_analysis_report.txt"
+        )
+        reporter.generate_next_day_report(
+            output_file=f"{instrument_name.lower()}_next_day_report.txt"
+        )
 
-        # Export files
+        # Export data files
         export_to_json(analyzer, insights)
         export_to_csv(results_df, f"{instrument_name.lower()}_level_results.csv")
 
