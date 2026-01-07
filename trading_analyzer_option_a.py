@@ -123,14 +123,75 @@ if not API_KEY:
 # Trading Configuration
 SYMBOL = "ES.v.0"
 TZ_STR = 'America/New_York'
-TRAINING_FILE = "ml_training_data_option_a.csv"
-MODEL_FILE = "trained_model_option_a.pkl"
+
+# === MULTI-PHASE TRAINING SYSTEM ===
+# Phase 1: MACRO (30-min windows, 7 mega-patterns, months of historical data)
+# Phase 2: INTERMEDIATE (5-min windows, analyze between macro pivots)
+# Phase 3: GRANULAR (1-min windows, 15 fine-grained patterns)
+
+TRAINING_MODE = "MACRO"  # Options: "MACRO", "INTERMEDIATE", "GRANULAR"
+
+# Training files per phase
+TRAINING_FILE_MACRO = "ml_training_data_macro.csv"
+TRAINING_FILE_INTERMEDIATE = "ml_training_data_intermediate.csv"
+TRAINING_FILE_GRANULAR = "ml_training_data_granular.csv"
+
+MODEL_FILE_MACRO = "trained_model_macro.pkl"
+MODEL_FILE_INTERMEDIATE = "trained_model_intermediate.pkl"
+MODEL_FILE_GRANULAR = "trained_model_granular.pkl"
+
+# Select active files based on mode
+if TRAINING_MODE == "MACRO":
+    TRAINING_FILE = TRAINING_FILE_MACRO
+    MODEL_FILE = MODEL_FILE_MACRO
+    BASE_ANALYSIS_WINDOW_MINUTES = 30  # 30-minute windows for macro analysis
+elif TRAINING_MODE == "INTERMEDIATE":
+    TRAINING_FILE = TRAINING_FILE_INTERMEDIATE
+    MODEL_FILE = MODEL_FILE_INTERMEDIATE
+    BASE_ANALYSIS_WINDOW_MINUTES = 5   # 5-minute windows
+else:  # GRANULAR
+    TRAINING_FILE = TRAINING_FILE_GRANULAR
+    MODEL_FILE = MODEL_FILE_GRANULAR
+    BASE_ANALYSIS_WINDOW_MINUTES = 10  # 10-minute windows (original)
+
+# 7 Mega-Patterns for MACRO training (Phase 1)
+MEGA_PATTERNS = [
+    "SESSION_EXTREME",      # 1: HIGH OF DAY / LOW OF DAY combined
+    "REVERSAL_BUY",         # 2: BUY REVERSAL + PULLBACK BUY REVERSAL
+    "REVERSAL_SELL",        # 3: SELL REVERSAL + PULLBACK SELL REVERSAL
+    "CONTINUATION_BUY",     # 4: BUY CONTINUATION + PULLBACK BUY CONTINUATION + BUY IMPULSE
+    "CONTINUATION_SELL",    # 5: SELL CONTINUATION + PULLBACK SELL CONTINUATION + SELL IMPULSE
+    "FALSE_REVERSAL",       # 6: All FALSE patterns combined
+    "CONSOLIDATION"         # 7: CONSOLIDATION
+]
+
+# Mapping from 15 granular patterns to 7 mega-patterns
+PATTERN_TO_MEGA = {
+    "HIGH OF DAY": "SESSION_EXTREME",
+    "LOW OF DAY": "SESSION_EXTREME",
+    "BUY REVERSAL": "REVERSAL_BUY",
+    "SELL REVERSAL": "REVERSAL_SELL",
+    "FALSE BUY REVERSAL": "FALSE_REVERSAL",
+    "FALSE SELL REVERSAL": "FALSE_REVERSAL",
+    "PULLBACK BUY REVERSAL": "REVERSAL_BUY",
+    "PULLBACK SELL REVERSAL": "REVERSAL_SELL",
+    "PULLBACK BUY CONTINUATION": "CONTINUATION_BUY",
+    "PULLBACK SELL CONTINUATION": "CONTINUATION_SELL",
+    "BUY CONTINUATION": "CONTINUATION_BUY",
+    "SELL CONTINUATION": "CONTINUATION_SELL",
+    "BUY IMPULSE": "CONTINUATION_BUY",
+    "SELL IMPULSE": "CONTINUATION_SELL",
+    "CONSOLIDATION": "CONSOLIDATION",
+    # Legacy patterns
+    "FALSE BUY IMPULSE": "FALSE_REVERSAL",
+    "FALSE SELL IMPULSE": "FALSE_REVERSAL",
+    "FALSE REVERSAL": "FALSE_REVERSAL"
+}
 
 # Analysis Parameters
 PRICE_SCALE_FACTOR = 1e9
 CONSOLIDATION_RANGE_THRESHOLD = 4.0  # Points
 CONSOLIDATION_MIN_DURATION = 5  # Minutes
-BASE_ANALYSIS_WINDOW_MINUTES = 10  # Base window (will adapt)
 PRE_EVENT_LOOKBACK_MINUTES = 15
 MIN_RANGE_FOR_ABSORPTION = 0.5
 
@@ -970,23 +1031,31 @@ class TradeClassifier:
             'consolidation_duration', 'breakout_magnitude'
         ]
 
-        self.labels_map = [
-            "HIGH OF DAY",           # 1: Session high (RTH)
-            "LOW OF DAY",            # 2: Session low (RTH)
-            "BUY REVERSAL",          # 3: Significant low, moves 10+ pts (ES) or 20+ pts (NQ)
-            "SELL REVERSAL",         # 4: Significant high, moves 10+ pts (ES) or 20+ pts (NQ)
-            "FALSE BUY REVERSAL",    # 5: Shallow bounce 5-10 pts (ES) or 10-20 pts (NQ)
-            "FALSE SELL REVERSAL",   # 6: Shallow pullback 5-10 pts (ES) or 10-20 pts (NQ)
-            "PULLBACK BUY REVERSAL", # 7: After false sell reversal, resumes buying
-            "PULLBACK SELL REVERSAL",# 8: After false buy reversal, resumes selling
-            "PULLBACK BUY CONTINUATION",  # 9: After pullback buy reversal, breakout
-            "PULLBACK SELL CONTINUATION", # 10: After pullback sell reversal, breakdown
-            "BUY CONTINUATION",      # 11: Makes higher high, closes above previous
-            "SELL CONTINUATION",     # 12: Makes lower low, closes below previous
-            "BUY IMPULSE",           # 13: Large green candle or large wick, high volume
-            "SELL IMPULSE",          # 14: Large red candle or large wick, high volume
-            "CONSOLIDATION"          # 15: Choppy period with many false reversals
-        ]
+        # Select label set based on training mode
+        if TRAINING_MODE == "MACRO":
+            # Phase 1: 7 mega-patterns for macro analysis
+            self.labels_map = MEGA_PATTERNS.copy()
+            print(f"[TRAINING MODE] MACRO - 7 Mega-Patterns | 30-min windows")
+        else:
+            # Phase 2/3: 15 granular patterns
+            self.labels_map = [
+                "HIGH OF DAY",           # 1: Session high (RTH)
+                "LOW OF DAY",            # 2: Session low (RTH)
+                "BUY REVERSAL",          # 3: Significant low, moves 10+ pts (ES) or 20+ pts (NQ)
+                "SELL REVERSAL",         # 4: Significant high, moves 10+ pts (ES) or 20+ pts (NQ)
+                "FALSE BUY REVERSAL",    # 5: Shallow bounce 5-10 pts (ES) or 10-20 pts (NQ)
+                "FALSE SELL REVERSAL",   # 6: Shallow pullback 5-10 pts (ES) or 10-20 pts (NQ)
+                "PULLBACK BUY REVERSAL", # 7: After false sell reversal, resumes buying
+                "PULLBACK SELL REVERSAL",# 8: After false buy reversal, resumes selling
+                "PULLBACK BUY CONTINUATION",  # 9: After pullback buy reversal, breakout
+                "PULLBACK SELL CONTINUATION", # 10: After pullback sell reversal, breakdown
+                "BUY CONTINUATION",      # 11: Makes higher high, closes above previous
+                "SELL CONTINUATION",     # 12: Makes lower low, closes below previous
+                "BUY IMPULSE",           # 13: Large green candle or large wick, high volume
+                "SELL IMPULSE",          # 14: Large red candle or large wick, high volume
+                "CONSOLIDATION"          # 15: Choppy period with many false reversals
+            ]
+            print(f"[TRAINING MODE] {TRAINING_MODE} - 15 Granular Patterns")
 
     def load_model(self) -> bool:
         """Load pre-trained model from disk."""
@@ -1853,6 +1922,47 @@ def analyze_pattern_similarity(pred_label: str, true_label: str) -> dict:
     }
 
 
+def convert_to_mega_pattern(granular_label: str) -> str:
+    """
+    Convert a granular pattern label to its mega-pattern equivalent.
+    Used in MACRO mode to group fine-grained patterns into 7 categories.
+    """
+    # Normalize label
+    normalized = granular_label.upper().strip()
+
+    # Direct lookup
+    if normalized in PATTERN_TO_MEGA:
+        return PATTERN_TO_MEGA[normalized]
+
+    # Try with spaces removed
+    normalized_no_space = normalized.replace(' ', '')
+    for granular, mega in PATTERN_TO_MEGA.items():
+        if granular.replace(' ', '') == normalized_no_space:
+            return mega
+
+    # Default to closest match based on keywords
+    if 'BUY' in normalized and 'FALSE' in normalized:
+        return "FALSE_REVERSAL"
+    elif 'SELL' in normalized and 'FALSE' in normalized:
+        return "FALSE_REVERSAL"
+    elif 'BUY' in normalized and ('REVERSAL' in normalized or 'PULLBACK' in normalized):
+        return "REVERSAL_BUY"
+    elif 'SELL' in normalized and ('REVERSAL' in normalized or 'PULLBACK' in normalized):
+        return "REVERSAL_SELL"
+    elif 'BUY' in normalized:
+        return "CONTINUATION_BUY"
+    elif 'SELL' in normalized:
+        return "CONTINUATION_SELL"
+    elif 'CONSOLIDATION' in normalized:
+        return "CONSOLIDATION"
+    elif 'HIGH' in normalized or 'LOW' in normalized or 'HOD' in normalized or 'LOD' in normalized:
+        return "SESSION_EXTREME"
+    else:
+        # Unknown pattern, default to consolidation
+        print(f"[WARN] Unknown pattern '{granular_label}', defaulting to CONSOLIDATION")
+        return "CONSOLIDATION"
+
+
 def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
                                    date_obj: datetime.date, tz: pytz.timezone,
                                    ai_brain: TradeClassifier,
@@ -1871,6 +1981,8 @@ def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
     """
     print("\n" + "="*80)
     print("BATCH PROCESSING MODE - Analyzing patterns before checking labels...")
+    if TRAINING_MODE == "MACRO":
+        print(f"[MACRO MODE] Using {BASE_ANALYSIS_WINDOW_MINUTES}-minute windows with 7 mega-patterns")
     print("="*80)
 
     # Parse input - handle both ; and , as separators between pairs
@@ -1911,6 +2023,10 @@ def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
 
         time_str = parts[0].strip()
         label_str = parts[1].strip().upper()
+
+        # Convert to mega-pattern if in MACRO mode
+        if TRAINING_MODE == "MACRO":
+            label_str = convert_to_mega_pattern(label_str)
 
         time_label_pairs.append((time_str, label_str))
 
@@ -1991,6 +2107,10 @@ def parse_batch_inputs_with_labels(user_input: str, df: pd.DataFrame,
             else:
                 predicted_label = heuristic_label
                 source = "Heuristic"
+
+            # Convert prediction to mega-pattern if in MACRO mode
+            if TRAINING_MODE == "MACRO":
+                predicted_label = convert_to_mega_pattern(predicted_label)
 
             # Store result (user label is NOT used yet)
             results.append({
@@ -2209,6 +2329,10 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
                 final_display_label = heuristic_label
                 source = "RULE-BASED"
 
+            # Convert to mega-pattern if in MACRO mode
+            if TRAINING_MODE == "MACRO":
+                final_display_label = convert_to_mega_pattern(final_display_label)
+
             # REPORT
             print(f"\n" + "="*80)
             print(f">>> ANALYSIS: {item} | Source: {source}")
@@ -2272,23 +2396,29 @@ def parse_and_process_inputs(user_input: str, df: pd.DataFrame,
 
                 elif user_conf == 'n':
                     print("\nSelect Correct Label:")
-                    options = [
-                        "HIGH OF DAY",
-                        "LOW OF DAY",
-                        "BUY REVERSAL",
-                        "SELL REVERSAL",
-                        "FALSE BUY REVERSAL",
-                        "FALSE SELL REVERSAL",
-                        "PULLBACK BUY REVERSAL",
-                        "PULLBACK SELL REVERSAL",
-                        "PULLBACK BUY CONTINUATION",
-                        "PULLBACK SELL CONTINUATION",
-                        "BUY CONTINUATION",
-                        "SELL CONTINUATION",
-                        "BUY IMPULSE",
-                        "SELL IMPULSE",
-                        "CONSOLIDATION"
-                    ]
+
+                    # Show different options based on training mode
+                    if TRAINING_MODE == "MACRO":
+                        options = MEGA_PATTERNS.copy()
+                    else:
+                        options = [
+                            "HIGH OF DAY",
+                            "LOW OF DAY",
+                            "BUY REVERSAL",
+                            "SELL REVERSAL",
+                            "FALSE BUY REVERSAL",
+                            "FALSE SELL REVERSAL",
+                            "PULLBACK BUY REVERSAL",
+                            "PULLBACK SELL REVERSAL",
+                            "PULLBACK BUY CONTINUATION",
+                            "PULLBACK SELL CONTINUATION",
+                            "BUY CONTINUATION",
+                            "SELL CONTINUATION",
+                            "BUY IMPULSE",
+                            "SELL IMPULSE",
+                            "CONSOLIDATION"
+                        ]
+
                     for i, opt in enumerate(options):
                         print(f" {i+1}. {opt}")
 
@@ -2336,7 +2466,12 @@ def main():
     """Main entry point."""
     print("="*80)
     print("Trading Pattern Classifier - OPTION A (33 FEATURES)")
-    print("15 Patterns | 33 Features | Sequence + Incremental + Consolidation Context")
+    if TRAINING_MODE == "MACRO":
+        print(f"MACRO MODE | 7 Mega-Patterns | {BASE_ANALYSIS_WINDOW_MINUTES}-min windows | 33 Features")
+    elif TRAINING_MODE == "INTERMEDIATE":
+        print(f"INTERMEDIATE MODE | 15 Patterns | {BASE_ANALYSIS_WINDOW_MINUTES}-min windows | 33 Features")
+    else:  # GRANULAR
+        print(f"GRANULAR MODE | 15 Patterns | {BASE_ANALYSIS_WINDOW_MINUTES}-min windows | 33 Features")
     print("="*80)
 
     # Initialize AI
@@ -2396,6 +2531,8 @@ def main():
     print("  BATCH MODE (with labels - faster!):")
     print("    - Format: 9:30, high of day; 9:31, sell impulse; 10:42-10:49, consolidation")
     print("    - Script analyzes ALL patterns first, then compares to your labels")
+    if TRAINING_MODE == "MACRO":
+        print("    - MACRO MODE: Enter granular patterns - they'll auto-convert to mega-patterns")
     print("")
     print("  Type 'q' to quit")
     print("  Type 'seq' to view ML-learned sequences")
