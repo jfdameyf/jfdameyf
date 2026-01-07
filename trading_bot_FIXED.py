@@ -780,6 +780,36 @@ class LiveBot:
         # Also log to file
         logging.info(f"SIGNAL: {direction} {order_type} @ {price:.2f} | Size: {size_mod}x | {message}")
 
+        # Send Discord alert
+        self.send_discord_alert(price, order_type, direction, size_mod, message, current_time)
+
+    def send_discord_alert(self, price, order_type, direction, size_mod, message, timestamp):
+        """Send signal alert to Discord webhook"""
+        if not DISCORD_WEBHOOK_URL or "https" not in DISCORD_WEBHOOK_URL:
+            return
+
+        # Color based on direction
+        color = 0x00ff00 if direction == "LONG" else 0xff0000  # Green for LONG, Red for SHORT
+
+        # Emoji for visual clarity
+        direction_emoji = "🟢" if direction == "LONG" else "🔴"
+
+        embed = {
+            "title": f"🚀 {direction_emoji} ES {direction} SIGNAL",
+            "description": f"**Entry Price:** {price:.2f}\n**Type:** {order_type}\n**Size:** {size_mod}x",
+            "color": color,
+            "fields": [
+                {"name": "📊 Details", "value": message, "inline": False},
+                {"name": "⏰ Time", "value": timestamp.strftime('%Y-%m-%d %H:%M:%S ET'), "inline": False}
+            ],
+            "footer": {"text": "ES Trading Bot • Live Signal"}
+        }
+
+        try:
+            requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+        except:
+            pass  # Silently fail if Discord webhook errors
+
     def start(self):
         """
         ✅ IMPROVED: Pre-flight checks and better price handling
