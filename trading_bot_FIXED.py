@@ -39,6 +39,7 @@ OUTPUT_FILE = "daily_context_v2.json"
 STATE_FILE = "strategy_state.json"
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
+SIGNAL_LOG_FILE = f"{LOG_DIR}/es_signals_{datetime.now().strftime('%Y%m%d')}.csv"
 
 # Heuristics
 BUFFER_PCT = 0.20
@@ -824,8 +825,59 @@ class LiveBot:
         # Also log to file
         logging.info(f"SIGNAL: {direction} {order_type} @ {price:.2f} | Size: {size_mod}x | {message}")
 
+        # Log signal to CSV for backtesting
+        self.log_signal_to_csv(current_time, direction, order_type, price, size_mod, message)
+
         # Send Discord alert
         self.send_discord_alert(price, order_type, direction, size_mod, message, current_time)
+
+    def log_signal_to_csv(self, timestamp, direction, order_type, price, size_mod, message):
+        """Log signal to CSV file for backtesting analysis"""
+        import csv
+
+        # Create CSV with headers if it doesn't exist
+        file_exists = os.path.exists(SIGNAL_LOG_FILE)
+
+        try:
+            with open(SIGNAL_LOG_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+
+                # Write header if new file
+                if not file_exists:
+                    writer.writerow([
+                        'timestamp',
+                        'date',
+                        'time',
+                        'direction',
+                        'type',
+                        'entry_price',
+                        'size_modifier',
+                        'zone_info',
+                        'details'
+                    ])
+
+                # Extract zone from message if available
+                zone = 'Unknown'
+                if 'Zone' in message:
+                    try:
+                        zone = message.split('Zone')[1].split(':')[0].strip()
+                    except:
+                        pass
+
+                # Write signal data
+                writer.writerow([
+                    timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                    timestamp.strftime('%Y-%m-%d'),
+                    timestamp.strftime('%H:%M:%S'),
+                    direction,
+                    order_type,
+                    f"{price:.2f}",
+                    f"{size_mod}x",
+                    zone,
+                    message
+                ])
+        except Exception as e:
+            logging.warning(f"Failed to write signal to CSV: {e}")
 
     def send_discord_alert(self, price, order_type, direction, size_mod, message, timestamp):
         """Send signal alert to Discord webhook"""
