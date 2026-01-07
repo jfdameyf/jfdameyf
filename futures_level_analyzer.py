@@ -54,6 +54,10 @@ INSTRUMENT_CONFIG = {
         "touch_buffer": 2.0,
         "break_threshold": 4.5,
         "hold_min_move": 6.0,
+        # NEW: Time-based confirmation settings
+        "break_confirm_bars": 3,      # Bars price must stay through level to confirm break (3 bars = 15min on 5m)
+        "reaction_window_bars": 6,    # Bars to assess immediate reaction (6 bars = 30min on 5m)
+        "consolidation_threshold": 3, # Crosses back and forth = consolidation, not multiple breaks
         # Price clustering for heatmap
         "cluster_size": 2.0,
     },
@@ -66,6 +70,10 @@ INSTRUMENT_CONFIG = {
         "touch_buffer": 8.0,
         "break_threshold": 18.0,
         "hold_min_move": 25.0,
+        # NEW: Time-based confirmation settings
+        "break_confirm_bars": 3,
+        "reaction_window_bars": 6,
+        "consolidation_threshold": 3,
         "cluster_size": 10.0,
     }
 }
@@ -122,11 +130,20 @@ class LevelResult:
     level_type: str  # 'RES' or 'SUP'
     zone: str
     category: str
-    outcome: str  # 'UNTOUCHED', 'HELD', 'BROKEN', 'CHOP'
-    mae: float  # Maximum Adverse Excursion
-    mfe: float  # Maximum Favorable Excursion
+    outcome: str  # 'UNTOUCHED', 'HELD', 'BROKEN', 'CHOP', 'CONSOLIDATION'
+    mae: float  # Maximum Adverse Excursion (full day)
+    mfe: float  # Maximum Favorable Excursion (full day)
     touch_time: Optional[str] = None
     hold_duration_bars: int = 0
+    # NEW: First touch specific metrics
+    first_touch_outcome: str = 'UNKNOWN'  # What happened on FIRST test
+    first_touch_mae: float = 0.0  # MAE within reaction window
+    first_touch_mfe: float = 0.0  # MFE within reaction window
+    # NEW: Break quality metrics
+    was_stop_hunt: bool = False  # Broke but immediately reversed
+    break_sustained: bool = False  # Break held for confirmation bars
+    num_tests: int = 1  # How many times level was tested
+    bars_to_break: int = 0  # How many bars after touch until break (0 = didn't break)
 
     def to_dict(self) -> Dict:
         return {
@@ -139,7 +156,15 @@ class LevelResult:
             'mae': self.mae,
             'mfe': self.mfe,
             'touch_time': self.touch_time,
-            'hold_duration': self.hold_duration_bars
+            'hold_duration': self.hold_duration_bars,
+            # New fields
+            'first_touch_outcome': self.first_touch_outcome,
+            'first_touch_mae': self.first_touch_mae,
+            'first_touch_mfe': self.first_touch_mfe,
+            'was_stop_hunt': self.was_stop_hunt,
+            'break_sustained': self.break_sustained,
+            'num_tests': self.num_tests,
+            'bars_to_break': self.bars_to_break
         }
 
 
@@ -357,6 +382,7 @@ class LevelAnalyzer:
     def evaluate_levels(self, date_str: str, plan: Dict) -> List[LevelResult]:
         """
         Evaluate all levels for a given date against actual market data.
+        Uses time-based confirmation to distinguish real breaks from stop hunts.
         Returns structured results for each level.
         """
         df = self.fetch_market_data(date_str)
@@ -369,6 +395,9 @@ class LevelAnalyzer:
         TOUCH = self.config['touch_buffer']
         BREAK = self.config['break_threshold']
         HOLD = self.config['hold_min_move']
+        CONFIRM_BARS = self.config.get('break_confirm_bars', 3)
+        REACTION_BARS = self.config.get('reaction_window_bars', 6)
+        CONSOL_THRESHOLD = self.config.get('consolidation_threshold', 3)
 
         # Extract levels from plan
         levels_to_check = []
@@ -397,62 +426,154 @@ class LevelAnalyzer:
                 results.append(LevelResult(
                     date=date_str, price=price, level_type=l_type,
                     zone=zone, category=category,
-                    outcome='UNTOUCHED', mae=0.0, mfe=0.0
+                    outcome='UNTOUCHED', mae=0.0, mfe=0.0,
+                    first_touch_outcome='UNTOUCHED'
                 ))
                 continue
 
             # Find bars that touched the level
             if l_type == 'RES':
-                mask = df['High'] >= (price - TOUCH)
+                touch_mask = df['High'] >= (price - TOUCH)
             else:
-                mask = df['Low'] <= (price + TOUCH)
+                touch_mask = df['Low'] <= (price + TOUCH)
 
-            # Handle case where broad filter passed but no bar actually touched
-            if not mask.any():
+            if not touch_mask.any():
                 results.append(LevelResult(
                     date=date_str, price=price, level_type=l_type,
                     zone=zone, category=category,
-                    outcome='UNTOUCHED', mae=0.0, mfe=0.0
+                    outcome='UNTOUCHED', mae=0.0, mfe=0.0,
+                    first_touch_outcome='UNTOUCHED'
                 ))
                 continue
 
-            # Get first touch and analyze post-touch behavior
-            first_touch_idx = df[mask].index[0]
+            # Get first touch
+            first_touch_idx = df[touch_mask].index[0]
             first_touch_time = first_touch_idx.strftime('%H:%M')
+            first_touch_pos = df.index.get_loc(first_touch_idx)
+
+            # ============================================================
+            # FIRST TOUCH ANALYSIS (Reaction Window)
+            # ============================================================
+            reaction_end_pos = min(first_touch_pos + REACTION_BARS, len(df))
+            reaction_df = df.iloc[first_touch_pos:reaction_end_pos]
+
+            if l_type == 'RES':
+                ft_mae = max(0.0, reaction_df['High'].max() - price)
+                ft_mfe = max(0.0, price - reaction_df['Low'].min())
+            else:
+                ft_mae = max(0.0, price - reaction_df['Low'].min())
+                ft_mfe = max(0.0, reaction_df['High'].max() - price)
+
+            # ============================================================
+            # CHECK FOR SUSTAINED BREAK vs STOP HUNT
+            # ============================================================
+            was_stop_hunt = False
+            break_sustained = False
+            bars_to_break = 0
+
+            # Find if/when price broke through
+            if l_type == 'RES':
+                break_mask = df['High'] > (price + BREAK)
+            else:
+                break_mask = df['Low'] < (price - BREAK)
+
+            broke_through = break_mask.any()
+
+            if broke_through:
+                # Find first break bar
+                first_break_idx = df[break_mask].index[0]
+                first_break_pos = df.index.get_loc(first_break_idx)
+                bars_to_break = first_break_pos - first_touch_pos
+
+                # Check if break was sustained (stayed through for CONFIRM_BARS)
+                confirm_end_pos = min(first_break_pos + CONFIRM_BARS, len(df))
+                confirm_df = df.iloc[first_break_pos:confirm_end_pos]
+
+                if len(confirm_df) >= CONFIRM_BARS:
+                    if l_type == 'RES':
+                        # For resistance break, check if lows stayed above level
+                        break_sustained = confirm_df['Low'].min() > price
+                    else:
+                        # For support break, check if highs stayed below level
+                        break_sustained = confirm_df['High'].max() < price
+
+                # Stop hunt: broke through but immediately reversed back
+                if not break_sustained and len(confirm_df) >= 2:
+                    if l_type == 'RES':
+                        # Reversed back below level quickly
+                        was_stop_hunt = confirm_df['Close'].iloc[-1] < price
+                    else:
+                        was_stop_hunt = confirm_df['Close'].iloc[-1] > price
+
+            # ============================================================
+            # COUNT NUMBER OF TESTS (for consolidation detection)
+            # ============================================================
+            # A "test" is when price comes back to the level after moving away
+            num_tests = 1
+            touch_indices = df[touch_mask].index.tolist()
+
+            # Group touches that are within 2 bars of each other as same test
+            if len(touch_indices) > 1:
+                current_test_start = touch_indices[0]
+                for idx in touch_indices[1:]:
+                    pos_diff = df.index.get_loc(idx) - df.index.get_loc(current_test_start)
+                    if pos_diff > 2:  # Gap of more than 2 bars = new test
+                        num_tests += 1
+                        current_test_start = idx
+
+            # ============================================================
+            # FULL DAY MAE/MFE
+            # ============================================================
             post_touch_df = df[df.index >= first_touch_idx]
 
-            if post_touch_df.empty:
-                continue
-
-            # Calculate MAE and MFE
             if l_type == 'RES':
-                max_price_after = post_touch_df['High'].max()
-                min_price_after = post_touch_df['Low'].min()
-                mae = max(0.0, max_price_after - price)
-                mfe = max(0.0, price - min_price_after)
-            else:  # SUP
-                min_price_after = post_touch_df['Low'].min()
-                max_price_after = post_touch_df['High'].max()
-                mae = max(0.0, price - min_price_after)
-                mfe = max(0.0, max_price_after - price)
+                mae = max(0.0, post_touch_df['High'].max() - price)
+                mfe = max(0.0, price - post_touch_df['Low'].min())
+            else:
+                mae = max(0.0, price - post_touch_df['Low'].min())
+                mfe = max(0.0, post_touch_df['High'].max() - price)
 
-            # Determine outcome
-            if mae > BREAK:
+            # ============================================================
+            # DETERMINE OUTCOMES
+            # ============================================================
+            # First touch outcome (what a trader would experience on first test)
+            if ft_mae > BREAK and not was_stop_hunt:
+                first_touch_outcome = 'BROKEN'
+            elif ft_mfe > HOLD:
+                first_touch_outcome = 'HELD'
+            elif was_stop_hunt:
+                first_touch_outcome = 'STOP_HUNT'
+            else:
+                first_touch_outcome = 'CHOP'
+
+            # Overall outcome (considering full day and nuances)
+            if num_tests >= CONSOL_THRESHOLD and not break_sustained:
+                outcome = 'CONSOLIDATION'
+            elif mae > BREAK and break_sustained:
                 outcome = 'BROKEN'
+            elif mae > BREAK and was_stop_hunt:
+                outcome = 'STOP_HUNT'
             elif mfe > HOLD:
                 outcome = 'HELD'
+            elif mae > BREAK:
+                # Broke but not sustained - treat as eventual break
+                outcome = 'BROKEN_WEAK'
             else:
                 outcome = 'CHOP'
-
-            # Calculate hold duration (bars before break or end of day)
-            hold_duration = len(post_touch_df)
 
             results.append(LevelResult(
                 date=date_str, price=price, level_type=l_type,
                 zone=zone, category=category,
                 outcome=outcome, mae=round(mae, 2), mfe=round(mfe, 2),
                 touch_time=first_touch_time,
-                hold_duration_bars=hold_duration
+                hold_duration_bars=len(post_touch_df),
+                first_touch_outcome=first_touch_outcome,
+                first_touch_mae=round(ft_mae, 2),
+                first_touch_mfe=round(ft_mfe, 2),
+                was_stop_hunt=was_stop_hunt,
+                break_sustained=break_sustained,
+                num_tests=num_tests,
+                bars_to_break=bars_to_break
             ))
 
         return results
@@ -560,18 +681,73 @@ class TradingInsights:
             'outcome': [
                 'count',
                 lambda x: (x == 'HELD').sum(),
-                lambda x: (x == 'BROKEN').sum(),
-                lambda x: (x == 'CHOP').sum()
+                lambda x: (x.isin(['BROKEN', 'BROKEN_WEAK'])).sum(),
+                lambda x: (x == 'STOP_HUNT').sum(),
+                lambda x: (x == 'CONSOLIDATION').sum()
             ],
             'mae': 'mean',
             'mfe': 'mean'
         }).round(2)
 
-        stats.columns = ['Total', 'Held', 'Broken', 'Chop', 'Avg_MAE', 'Avg_MFE']
+        stats.columns = ['Total', 'Held', 'Broken', 'StopHunt', 'Consol', 'Avg_MAE', 'Avg_MFE']
         stats['Hold_Rate%'] = (stats['Held'] / stats['Total'] * 100).round(1)
         stats['Edge'] = (stats['Avg_MFE'] - stats['Avg_MAE']).round(2)
 
         return stats.sort_values('Hold_Rate%', ascending=False)
+
+    def get_first_touch_performance(self) -> pd.DataFrame:
+        """
+        Analyze FIRST TOUCH performance - most relevant for actual trading.
+        This shows what would happen if you traded the first test of each level.
+        """
+        if self.df.empty:
+            return pd.DataFrame()
+
+        touched = self.df[self.df['first_touch_outcome'] != 'UNTOUCHED'].copy()
+        if touched.empty:
+            return pd.DataFrame()
+
+        stats = touched.groupby('category').agg({
+            'first_touch_outcome': [
+                'count',
+                lambda x: (x == 'HELD').sum(),
+                lambda x: (x == 'BROKEN').sum(),
+                lambda x: (x == 'STOP_HUNT').sum()
+            ],
+            'first_touch_mae': 'mean',
+            'first_touch_mfe': 'mean'
+        }).round(2)
+
+        stats.columns = ['Total', 'Held', 'Broken', 'StopHunt', 'Avg_MAE', 'Avg_MFE']
+        # For first touch, "Win" = Held OR StopHunt (both are tradeable wins)
+        stats['Win_Rate%'] = ((stats['Held'] + stats['StopHunt']) / stats['Total'] * 100).round(1)
+        stats['Edge'] = (stats['Avg_MFE'] - stats['Avg_MAE']).round(2)
+
+        return stats.sort_values('Win_Rate%', ascending=False)
+
+    def get_stop_hunt_analysis(self) -> Dict:
+        """Analyze stop hunt frequency and characteristics."""
+        if self.df.empty:
+            return {}
+
+        touched = self.df[self.df['outcome'] != 'UNTOUCHED']
+        if touched.empty:
+            return {}
+
+        total = len(touched)
+        stop_hunts = len(touched[touched['was_stop_hunt'] == True])
+        sustained_breaks = len(touched[touched['break_sustained'] == True])
+        consolidations = len(touched[touched['outcome'] == 'CONSOLIDATION'])
+
+        return {
+            'total_tested': total,
+            'stop_hunts': stop_hunts,
+            'stop_hunt_rate': round(stop_hunts / total * 100, 1) if total > 0 else 0,
+            'sustained_breaks': sustained_breaks,
+            'sustained_break_rate': round(sustained_breaks / total * 100, 1) if total > 0 else 0,
+            'consolidations': consolidations,
+            'avg_tests_per_level': round(touched['num_tests'].mean(), 1)
+        }
 
     def get_zone_performance(self) -> pd.DataFrame:
         """Analyze performance by zone (Zone 1, Zone 2, etc.)."""
@@ -890,18 +1066,42 @@ class ReportGenerator:
         # Overall Statistics
         self._section("OVERALL STATISTICS")
         total = len(results_df)
-        touched = len(results_df[results_df['outcome'] != 'UNTOUCHED'])
-        held = len(results_df[results_df['outcome'] == 'HELD'])
-        broken = len(results_df[results_df['outcome'] == 'BROKEN'])
+        touched_df = results_df[results_df['outcome'] != 'UNTOUCHED']
+        touched = len(touched_df)
 
         self._add(f"  Total Levels: {total}")
         self._add(f"  Touched: {touched} ({touched/total*100:.1f}%)")
-        if touched > 0:
-            self._add(f"  Held: {held} ({held/touched*100:.1f}% of touched)")
-            self._add(f"  Broken: {broken} ({broken/touched*100:.1f}% of touched)")
 
-        # Category Performance
-        self._section("PERFORMANCE BY CATEGORY")
+        if touched > 0:
+            held = len(touched_df[touched_df['outcome'] == 'HELD'])
+            broken = len(touched_df[touched_df['outcome'].isin(['BROKEN', 'BROKEN_WEAK'])])
+            stop_hunts = len(touched_df[touched_df['outcome'] == 'STOP_HUNT'])
+            consol = len(touched_df[touched_df['outcome'] == 'CONSOLIDATION'])
+
+            self._add(f"  Held: {held} ({held/touched*100:.1f}%)")
+            self._add(f"  Broken (sustained): {broken} ({broken/touched*100:.1f}%)")
+            self._add(f"  Stop Hunts (fake breaks): {stop_hunts} ({stop_hunts/touched*100:.1f}%)")
+            self._add(f"  Consolidation: {consol} ({consol/touched*100:.1f}%)")
+
+        # Stop Hunt Analysis
+        self._section("BREAK QUALITY ANALYSIS")
+        sh_stats = self.insights.get_stop_hunt_analysis()
+        if sh_stats:
+            self._add(f"  Avg tests per level: {sh_stats['avg_tests_per_level']}")
+            self._add(f"  Stop hunt rate: {sh_stats['stop_hunt_rate']}% (broke but reversed quickly)")
+            self._add(f"  Sustained break rate: {sh_stats['sustained_break_rate']}% (broke and held through)")
+
+        # FIRST TOUCH Performance (Most Important for Trading!)
+        self._section("FIRST TOUCH PERFORMANCE (Trading Relevant)")
+        self._add("  [Shows outcome if you traded the FIRST test of each level]")
+        ft_perf = self.insights.get_first_touch_performance()
+        if not ft_perf.empty:
+            self._add(ft_perf.to_string())
+        else:
+            self._add("  No data available")
+
+        # Category Performance (Full Day)
+        self._section("FULL DAY PERFORMANCE BY CATEGORY")
         cat_perf = self.insights.get_category_performance()
         if not cat_perf.empty:
             self._add(cat_perf.to_string())
@@ -938,11 +1138,19 @@ class ReportGenerator:
                 self._add("  No data")
                 continue
 
-            touched_df = tf_df[tf_df['outcome'] != 'UNTOUCHED']
-            if len(touched_df) > 0:
-                held = len(touched_df[touched_df['outcome'] == 'HELD'])
-                broken = len(touched_df[touched_df['outcome'] == 'BROKEN'])
-                self._add(f"  Tested: {len(touched_df)} | Held: {held} ({held/len(touched_df)*100:.0f}%) | Broken: {broken}")
+            touched_tf = tf_df[tf_df['outcome'] != 'UNTOUCHED']
+            if len(touched_tf) > 0:
+                held = len(touched_tf[touched_tf['outcome'] == 'HELD'])
+                broken = len(touched_tf[touched_tf['outcome'].isin(['BROKEN', 'BROKEN_WEAK'])])
+                stop_hunts = len(touched_tf[touched_tf['outcome'] == 'STOP_HUNT'])
+                self._add(f"  Tested: {len(touched_tf)} | Held: {held} | Broken: {broken} | StopHunts: {stop_hunts}")
+
+                # First touch stats for this timeframe
+                ft_held = len(touched_tf[touched_tf['first_touch_outcome'] == 'HELD'])
+                ft_broken = len(touched_tf[touched_tf['first_touch_outcome'] == 'BROKEN'])
+                ft_sh = len(touched_tf[touched_tf['first_touch_outcome'] == 'STOP_HUNT'])
+                ft_wins = ft_held + ft_sh
+                self._add(f"  First Touch: {ft_wins}/{len(touched_tf)} wins ({ft_wins/len(touched_tf)*100:.0f}%) [Held:{ft_held} StopHunt:{ft_sh} Broken:{ft_broken}]")
 
             # Recurring levels
             recurring = self.insights.get_recurring_levels(dates)
