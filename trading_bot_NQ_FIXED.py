@@ -212,12 +212,14 @@ class StrategyManager:
             else:
                 return "WAIT", 0.0, f"Zone {zone}: Waiting for approach (dist: {distance:.1f})"
 
-        # ZONES 3 & 4: Recapture
+        # ZONES 3 & 4: Recapture & Flip
         elif zone in [3, 4]:
             signal = self.detect_level_recapture(current_price, level_price, l_type)
 
             if signal == "TRIGGER":
                 return "RECAPTURE_ENTRY", modifier, f"Zone {zone}: Recaptured! {reason}"
+            elif signal == "FLIP_TRIGGER":
+                return "FLIP_ENTRY", modifier, f"Zone {zone}: FLIP Trade! (Old {'RES→SUP' if l_type == 'SUP' else 'SUP→RES'}) {reason}"
             elif signal == "WAITING_FOR_RECLAIM":
                 return "WAIT", 0.0, f"Zone {zone}: Monitoring... {reason}"
             else:
@@ -228,14 +230,21 @@ class StrategyManager:
     def detect_level_recapture(self, current_price, level_price, level_type):
         """
         ✅ IMPROVED: Relaxed thresholds (NQ scaled from ES)
+        ✅ NEW: Support/Resistance FLIP detection when levels FAIL
+
         ES: 0.75pt min, 15pt blowout, 0.50 buffer
         NQ: 3pt min, 50pt blowout, 2pt buffer (4x scaling)
+
+        When a level FAILS (blowout > 50pts):
+        - Old RES becomes potential new SUP (if price returns from above)
+        - Old SUP becomes potential new RES (if price returns from below)
+        - Same extension/reclaim requirements apply
         """
         key = f"{level_price:.2f}_{level_type}"
         state_changed = False
 
         if key not in self.active_monitors:
-            self.active_monitors[key] = {'state': 'WATCHING', 'extension': 0.0}
+            self.active_monitors[key] = {'state': 'WATCHING', 'extension': 0.0, 'is_flip': False}
             state_changed = True
 
         monitor = self.active_monitors[key]
@@ -257,7 +266,8 @@ class StrategyManager:
                     monitor['extension'] = float(violation_dist)
                     state_changed = True
                     result_signal = "WAITING_FOR_RECLAIM"
-                    logging.info(f"Monitor {key}: VIOLATED (ext: {violation_dist:.2f})")
+                    flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                    logging.info(f"Monitor {key}{flip_tag}: VIOLATED (ext: {violation_dist:.2f})")
 
             elif current_state == 'VIOLATED':
                 if current_price < level_price:
@@ -269,7 +279,20 @@ class StrategyManager:
                         monitor['state'] = 'FAILED'
                         state_changed = True
                         result_signal = "CANCEL"
-                        logging.info(f"Monitor {key}: FAILED (blowout: {violation_dist:.2f})")
+                        flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                        logging.info(f"Monitor {key}{flip_tag}: FAILED (blowout: {violation_dist:.2f})")
+
+                        # ✅ NEW: Create FLIP monitor (broken SUP becomes potential RES)
+                        if not monitor.get('is_flip', False):  # Don't flip a flip
+                            flip_key = f"{level_price:.2f}_RES"
+                            if flip_key not in self.active_monitors:
+                                self.active_monitors[flip_key] = {
+                                    'state': 'WATCHING',
+                                    'extension': 0.0,
+                                    'is_flip': True,
+                                    'original_type': 'SUP'
+                                }
+                                logging.info(f"📊 FLIP Monitor Created: {flip_key} (broken SUP → watch as RES)")
                     else:
                         result_signal = "WAITING_FOR_RECLAIM"
 
@@ -277,16 +300,18 @@ class StrategyManager:
                 elif current_price > level_price + RECLAIM_BUFFER:
                     if monitor['extension'] >= MIN_EXTENSION:
                         monitor['state'] = 'TRIGGERED'
-                        logging.info(f"SIGNAL - Monitor {key}: TRIGGERED! (ext: {monitor['extension']:.2f})")
+                        flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                        logging.info(f"SIGNAL - Monitor {key}{flip_tag}: TRIGGERED! (ext: {monitor['extension']:.2f})")
                         self.active_monitors.pop(key)
                         self.save_state()
-                        return "TRIGGER"
+                        return "FLIP_TRIGGER" if monitor.get('is_flip', False) else "TRIGGER"
                     else:
                         monitor['state'] = 'WATCHING'
                         monitor['extension'] = 0.0
                         state_changed = True
                         result_signal = "RESET"
-                        logging.info(f"Monitor {key}: RESET (insufficient extension)")
+                        flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                        logging.info(f"Monitor {key}{flip_tag}: RESET (insufficient extension)")
 
         # RESISTANCE (Short)
         elif level_type == 'RES':
@@ -298,7 +323,8 @@ class StrategyManager:
                     monitor['extension'] = float(violation_dist)
                     state_changed = True
                     result_signal = "WAITING_FOR_RECLAIM"
-                    logging.info(f"Monitor {key}: VIOLATED (ext: {violation_dist:.2f})")
+                    flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                    logging.info(f"Monitor {key}{flip_tag}: VIOLATED (ext: {violation_dist:.2f})")
 
             elif current_state == 'VIOLATED':
                 if current_price > level_price:
@@ -310,7 +336,20 @@ class StrategyManager:
                         monitor['state'] = 'FAILED'
                         state_changed = True
                         result_signal = "CANCEL"
-                        logging.info(f"Monitor {key}: FAILED (blowout: {violation_dist:.2f})")
+                        flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                        logging.info(f"Monitor {key}{flip_tag}: FAILED (blowout: {violation_dist:.2f})")
+
+                        # ✅ NEW: Create FLIP monitor (broken RES becomes potential SUP)
+                        if not monitor.get('is_flip', False):  # Don't flip a flip
+                            flip_key = f"{level_price:.2f}_SUP"
+                            if flip_key not in self.active_monitors:
+                                self.active_monitors[flip_key] = {
+                                    'state': 'WATCHING',
+                                    'extension': 0.0,
+                                    'is_flip': True,
+                                    'original_type': 'RES'
+                                }
+                                logging.info(f"📊 FLIP Monitor Created: {flip_key} (broken RES → watch as SUP)")
                     else:
                         result_signal = "WAITING_FOR_RECLAIM"
 
@@ -318,16 +357,18 @@ class StrategyManager:
                 elif current_price < level_price - RECLAIM_BUFFER:
                     if monitor['extension'] >= MIN_EXTENSION:
                         monitor['state'] = 'TRIGGERED'
-                        logging.info(f"SIGNAL - Monitor {key}: TRIGGERED! (ext: {monitor['extension']:.2f})")
+                        flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                        logging.info(f"SIGNAL - Monitor {key}{flip_tag}: TRIGGERED! (ext: {monitor['extension']:.2f})")
                         self.active_monitors.pop(key)
                         self.save_state()
-                        return "TRIGGER"
+                        return "FLIP_TRIGGER" if monitor.get('is_flip', False) else "TRIGGER"
                     else:
                         monitor['state'] = 'WATCHING'
                         monitor['extension'] = 0.0
                         state_changed = True
                         result_signal = "RESET"
-                        logging.info(f"Monitor {key}: RESET (insufficient extension)")
+                        flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
+                        logging.info(f"Monitor {key}{flip_tag}: RESET (insufficient extension)")
 
         if state_changed:
             self.save_state()
@@ -699,6 +740,9 @@ class LiveBot:
         elif action == "RECAPTURE_ENTRY":
             direction = "LONG" if level['type'] == 'SUP' else "SHORT"
             self.alert_signal(price, "MARKET / RECAPTURE", direction, mod, msg)
+        elif action == "FLIP_ENTRY":
+            direction = "LONG" if level['type'] == 'SUP' else "SHORT"
+            self.alert_signal(price, "MARKET / FLIP", direction, mod, msg)
 
     def alert_signal(self, price, order_type, direction, size_mod, message):
         """
