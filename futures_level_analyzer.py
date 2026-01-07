@@ -77,8 +77,16 @@ DATASET_ID = "GLBX.MDP3"
 # 🛠️ UTILITIES
 # ==============================================================================
 
+class NonRetryableError(Exception):
+    """Exception that should not be retried (client errors like 422)."""
+    pass
+
+
 def retry_on_failure(max_retries: int = 3, backoff_factor: float = 2.0):
-    """Decorator for retrying failed operations with exponential backoff."""
+    """
+    Decorator for retrying failed operations with exponential backoff.
+    Only retries on transient errors (network, 5xx). Does NOT retry on client errors (4xx).
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -86,7 +94,15 @@ def retry_on_failure(max_retries: int = 3, backoff_factor: float = 2.0):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
+                except NonRetryableError:
+                    # Don't retry client errors - re-raise immediately
+                    raise
                 except Exception as e:
+                    error_str = str(e)
+                    # Check if this is a client error (4xx) that shouldn't be retried
+                    if any(code in error_str for code in ['400', '401', '403', '404', '422']):
+                        raise NonRetryableError(str(e)) from e
+
                     last_exception = e
                     if attempt < max_retries - 1:
                         wait_time = backoff_factor ** attempt
@@ -260,6 +276,7 @@ class LevelAnalyzer:
 
         try:
             target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            now_utc = datetime.now(pytz.UTC)
 
             # Time range: 6 hours buffer on each side of NY trading day
             ny_start = self.ny_tz.localize(
@@ -270,8 +287,23 @@ class LevelAnalyzer:
                 datetime.combine(target_date + timedelta(days=1), datetime.min.time())
             ) + timedelta(hours=6)
 
-            start_iso = ny_start.astimezone(pytz.UTC).isoformat()
-            end_iso = ny_end.astimezone(pytz.UTC).isoformat()
+            # Cap end time to current time minus buffer (data may lag by ~30 min)
+            # This prevents 422 errors for recent dates
+            max_end = now_utc - timedelta(minutes=30)
+            ny_end_utc = ny_end.astimezone(pytz.UTC)
+            ny_start_utc = ny_start.astimezone(pytz.UTC)
+
+            if ny_start_utc > max_end:
+                # Entire date is in the future or too recent
+                logger.warning(f"Skipping {date_str}: data not yet available (date is too recent)")
+                return None
+
+            if ny_end_utc > max_end:
+                ny_end_utc = max_end
+                logger.debug(f"Capped end time to {max_end} for recent date {date_str}")
+
+            start_iso = ny_start_utc.isoformat()
+            end_iso = ny_end_utc.isoformat()
 
             logger.info(f"[{self.name}] Fetching data for {date_str}...")
 
@@ -460,6 +492,7 @@ class LevelAnalyzer:
         """
         Run analysis on all available dates and cache results.
         Returns DataFrame with all results.
+        Gracefully handles errors for individual dates.
         """
         all_dates = self.get_timeframe_dates('all')
 
@@ -470,10 +503,26 @@ class LevelAnalyzer:
         logger.info(f"Processing {len(all_dates)} days for {self.name}...")
 
         all_results = []
+        skipped_dates = []
+
         for date_str in all_dates:
-            if date_str in self.context_data:
+            if date_str not in self.context_data:
+                continue
+
+            try:
                 results = self.evaluate_levels(date_str, self.context_data[date_str])
                 all_results.extend(results)
+            except NonRetryableError as e:
+                # Client error (e.g., data not available yet) - skip this date
+                logger.warning(f"Skipping {date_str}: {e}")
+                skipped_dates.append(date_str)
+            except Exception as e:
+                # Unexpected error - log and continue
+                logger.error(f"Error processing {date_str}: {e}")
+                skipped_dates.append(date_str)
+
+        if skipped_dates:
+            logger.info(f"Skipped {len(skipped_dates)} dates due to errors: {skipped_dates}")
 
         self.results_cache = all_results
 
