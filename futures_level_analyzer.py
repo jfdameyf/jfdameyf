@@ -135,15 +135,20 @@ class LevelResult:
     mfe: float  # Maximum Favorable Excursion (full day)
     touch_time: Optional[str] = None
     hold_duration_bars: int = 0
-    # NEW: First touch specific metrics
+    # First touch specific metrics
     first_touch_outcome: str = 'UNKNOWN'  # What happened on FIRST test
     first_touch_mae: float = 0.0  # MAE within reaction window
     first_touch_mfe: float = 0.0  # MFE within reaction window
-    # NEW: Break quality metrics
+    # Break quality metrics
     was_stop_hunt: bool = False  # Broke but immediately reversed
     break_sustained: bool = False  # Break held for confirmation bars
     num_tests: int = 1  # How many times level was tested
     bars_to_break: int = 0  # How many bars after touch until break (0 = didn't break)
+    # NEW: Close price analysis
+    day_close: float = 0.0  # Day's closing price
+    close_vs_level: str = 'UNKNOWN'  # 'ABOVE', 'BELOW', 'AT'
+    close_confirms: bool = False  # Did close confirm the level's direction?
+    close_distance: float = 0.0  # How far close was from level (signed: + = above, - = below)
 
     def to_dict(self) -> Dict:
         return {
@@ -157,14 +162,19 @@ class LevelResult:
             'mfe': self.mfe,
             'touch_time': self.touch_time,
             'hold_duration': self.hold_duration_bars,
-            # New fields
+            # First touch fields
             'first_touch_outcome': self.first_touch_outcome,
             'first_touch_mae': self.first_touch_mae,
             'first_touch_mfe': self.first_touch_mfe,
             'was_stop_hunt': self.was_stop_hunt,
             'break_sustained': self.break_sustained,
             'num_tests': self.num_tests,
-            'bars_to_break': self.bars_to_break
+            'bars_to_break': self.bars_to_break,
+            # Close analysis fields
+            'day_close': self.day_close,
+            'close_vs_level': self.close_vs_level,
+            'close_confirms': self.close_confirms,
+            'close_distance': self.close_distance
         }
 
 
@@ -561,6 +571,31 @@ class LevelAnalyzer:
             else:
                 outcome = 'CHOP'
 
+            # ============================================================
+            # CLOSE PRICE ANALYSIS
+            # ============================================================
+            # Get day's closing price (last bar's close)
+            day_close = df['Close'].iloc[-1]
+            close_distance = round(day_close - price, 2)
+
+            # Determine close position relative to level
+            # Using a small tolerance (half of touch buffer) for "AT" classification
+            at_tolerance = TOUCH / 2
+            if abs(close_distance) <= at_tolerance:
+                close_vs_level = 'AT'
+            elif close_distance > 0:
+                close_vs_level = 'ABOVE'
+            else:
+                close_vs_level = 'BELOW'
+
+            # Determine if close confirms the level's intended function
+            # For RESISTANCE: close BELOW level = level confirmed (price rejected)
+            # For SUPPORT: close ABOVE level = level confirmed (price bounced)
+            if l_type == 'RES':
+                close_confirms = close_vs_level in ['BELOW', 'AT']
+            else:  # SUP
+                close_confirms = close_vs_level in ['ABOVE', 'AT']
+
             results.append(LevelResult(
                 date=date_str, price=price, level_type=l_type,
                 zone=zone, category=category,
@@ -573,7 +608,11 @@ class LevelAnalyzer:
                 was_stop_hunt=was_stop_hunt,
                 break_sustained=break_sustained,
                 num_tests=num_tests,
-                bars_to_break=bars_to_break
+                bars_to_break=bars_to_break,
+                day_close=round(day_close, 2),
+                close_vs_level=close_vs_level,
+                close_confirms=close_confirms,
+                close_distance=close_distance
             ))
 
         return results
@@ -748,6 +787,89 @@ class TradingInsights:
             'consolidations': consolidations,
             'avg_tests_per_level': round(touched['num_tests'].mean(), 1)
         }
+
+    def get_zone_reliability(self) -> pd.DataFrame:
+        """
+        Analyze zone reliability based on first touch outcome + close confirmation.
+        This helps identify which zones are best for scalping vs holding.
+
+        High close_confirm% with low first_touch_win% = level eventually works but risky to hold
+        High first_touch_win% with high close_confirm% = reliable for holding
+        """
+        if self.df.empty:
+            return pd.DataFrame()
+
+        touched = self.df[self.df['outcome'] != 'UNTOUCHED'].copy()
+        if touched.empty:
+            return pd.DataFrame()
+
+        stats = touched.groupby('zone').agg({
+            'first_touch_outcome': [
+                'count',
+                lambda x: (x.isin(['HELD', 'STOP_HUNT'])).sum(),  # First touch wins
+                lambda x: (x == 'BROKEN').sum()
+            ],
+            'close_confirms': [
+                lambda x: x.sum(),  # Close confirmed level
+            ],
+            'close_distance': 'mean',
+            'mfe': 'mean'
+        }).round(2)
+
+        stats.columns = ['Total', 'FT_Wins', 'FT_Broken', 'Close_Confirms', 'Avg_Close_Dist', 'Avg_MFE']
+        stats['FT_Win%'] = (stats['FT_Wins'] / stats['Total'] * 100).round(1)
+        stats['Close_Confirm%'] = (stats['Close_Confirms'] / stats['Total'] * 100).round(1)
+
+        # "Full Win" = First touch win AND close confirms
+        # Need to recalculate this from raw data
+        full_wins = touched.groupby('zone').apply(
+            lambda g: ((g['first_touch_outcome'].isin(['HELD', 'STOP_HUNT'])) & (g['close_confirms'])).sum()
+        )
+        stats['Full_Wins'] = full_wins
+        stats['Full_Win%'] = (stats['Full_Wins'] / stats['Total'] * 100).round(1)
+
+        # Recommendation based on metrics
+        def get_recommendation(row):
+            if row['Full_Win%'] >= 40:
+                return 'HOLD'  # Good for holding positions
+            elif row['FT_Win%'] >= 30:
+                return 'SCALP'  # Good for quick scalps
+            else:
+                return 'AVOID'
+
+        stats['Strategy'] = stats.apply(get_recommendation, axis=1)
+
+        return stats[['Total', 'FT_Win%', 'Close_Confirm%', 'Full_Win%', 'Avg_MFE', 'Strategy']].sort_index()
+
+    def get_close_analysis_by_category(self) -> pd.DataFrame:
+        """
+        Analyze how close price relates to levels by category.
+        Shows which level types tend to have price close in their favor.
+        """
+        if self.df.empty:
+            return pd.DataFrame()
+
+        touched = self.df[self.df['outcome'] != 'UNTOUCHED'].copy()
+        if touched.empty:
+            return pd.DataFrame()
+
+        stats = touched.groupby('category').agg({
+            'close_confirms': ['count', 'sum'],
+            'close_distance': ['mean', 'std'],
+            'first_touch_outcome': lambda x: (x.isin(['HELD', 'STOP_HUNT'])).sum()
+        }).round(2)
+
+        stats.columns = ['Total', 'Close_Confirms', 'Avg_Close_Dist', 'Close_Dist_Std', 'FT_Wins']
+        stats['Close_Confirm%'] = (stats['Close_Confirms'] / stats['Total'] * 100).round(1)
+        stats['FT_Win%'] = (stats['FT_Wins'] / stats['Total'] * 100).round(1)
+
+        # Full win calculation
+        full_wins = touched.groupby('category').apply(
+            lambda g: ((g['first_touch_outcome'].isin(['HELD', 'STOP_HUNT'])) & (g['close_confirms'])).sum()
+        )
+        stats['Full_Win%'] = (full_wins / stats['Total'] * 100).round(1)
+
+        return stats[['Total', 'FT_Win%', 'Close_Confirm%', 'Full_Win%', 'Avg_Close_Dist']].sort_values('Full_Win%', ascending=False)
 
     def get_zone_performance(self) -> pd.DataFrame:
         """Analyze performance by zone (Zone 1, Zone 2, etc.)."""
@@ -1116,6 +1238,25 @@ class ReportGenerator:
         else:
             self._add("  No data available")
 
+        # Zone Reliability (with close analysis) - KEY FOR STRATEGY SELECTION
+        self._section("ZONE RELIABILITY & STRATEGY (Close Analysis)")
+        self._add("  FT_Win% = First Touch Win Rate | Close_Confirm% = Price closed in level's favor")
+        self._add("  Full_Win% = Both FT win AND close confirms | Strategy = HOLD/SCALP/AVOID")
+        zone_rel = self.insights.get_zone_reliability()
+        if not zone_rel.empty:
+            self._add(zone_rel.to_string())
+        else:
+            self._add("  No data available")
+
+        # Close Analysis by Category
+        self._section("CLOSE ANALYSIS BY CATEGORY")
+        self._add("  Shows which level types tend to have price close in their favor")
+        close_cat = self.insights.get_close_analysis_by_category()
+        if not close_cat.empty:
+            self._add(close_cat.to_string())
+        else:
+            self._add("  No data available")
+
         # Time of Day Analysis
         self._section("TIME OF DAY ANALYSIS (Hour of First Touch)")
         tod = self.insights.get_time_of_day_analysis()
@@ -1208,6 +1349,23 @@ class ReportGenerator:
                 sw_flag = " [SUPER_WALL]" if zone['has_super_wall'] else ""
                 self._add(f"  {i}. {zone['price_low']:.2f} - {zone['price_high']:.2f} | "
                           f"{zone['count']} levels{sw_flag}")
+
+        # Zone Strategy Summary
+        self._section("ZONE STRATEGY GUIDE")
+        zone_rel = self.insights.get_zone_reliability()
+        if not zone_rel.empty:
+            self._add("  Based on historical first touch win rate + close confirmation:")
+            for zone_name in zone_rel.index:
+                row = zone_rel.loc[zone_name]
+                strategy = row.get('Strategy', 'N/A')
+                ft_win = row.get('FT_Win%', 0)
+                full_win = row.get('Full_Win%', 0)
+                if strategy == 'HOLD':
+                    self._add(f"  {zone_name}: HOLD position (FT:{ft_win}% Full:{full_win}%) - reliable for swing trades")
+                elif strategy == 'SCALP':
+                    self._add(f"  {zone_name}: SCALP only (FT:{ft_win}% Full:{full_win}%) - take quick profits")
+                else:
+                    self._add(f"  {zone_name}: AVOID (FT:{ft_win}% Full:{full_win}%) - low reliability")
 
         # Trading Notes
         self._section("TRADING NOTES")
