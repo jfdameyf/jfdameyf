@@ -744,16 +744,18 @@ class LiveBot:
         action, mod, msg = self.strategy.check_entry_signal(price, level)
 
         if action == "IMMEDIATE_ENTRY":
-            self.alert_signal(level['price'], "LIMIT / RESPONSIVE", mod, msg)
+            direction = "LONG" if level['type'] == 'SUP' else "SHORT"
+            self.alert_signal(level['price'], "LIMIT / RESPONSIVE", direction, mod, msg)
 
         elif action == "RECAPTURE_ENTRY":
-            self.alert_signal(price, "MARKET / RECAPTURE", mod, msg)
+            direction = "LONG" if level['type'] == 'SUP' else "SHORT"
+            self.alert_signal(price, "MARKET / RECAPTURE", direction, mod, msg)
 
-    def alert_signal(self, price, order_type, size_mod, message):
+    def alert_signal(self, price, order_type, direction, size_mod, message):
         """
         ✅ FIXED: Time-based deduplication instead of permanent blocking
         """
-        signal_key = f"{price:.2f}_{order_type}"
+        signal_key = f"{price:.2f}_{order_type}_{direction}"
         current_time = datetime.now()
 
         # Only suppress duplicates within 5 minutes
@@ -762,8 +764,11 @@ class LiveBot:
             if (current_time - last_fired).total_seconds() < 300:  # FIX: use total_seconds()
                 return
 
+        # Emoji for direction
+        direction_emoji = "🟢" if direction == "LONG" else "🔴"
+
         print(f"\n{'='*60}")
-        print(f"🚀 SIGNAL FIRED @ {price:.2f}")
+        print(f"🚀 {direction_emoji} {direction} SIGNAL @ {price:.2f}")
         print(f"   Type: {order_type}")
         print(f"   Size: {size_mod}x")
         print(f"   Info: {message}")
@@ -773,7 +778,7 @@ class LiveBot:
         self.active_signals[signal_key] = current_time
 
         # Also log to file
-        logging.info(f"SIGNAL: {order_type} @ {price:.2f} | Size: {size_mod}x | {message}")
+        logging.info(f"SIGNAL: {direction} {order_type} @ {price:.2f} | Size: {size_mod}x | {message}")
 
     def start(self):
         """

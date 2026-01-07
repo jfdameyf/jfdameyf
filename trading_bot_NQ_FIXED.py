@@ -694,25 +694,30 @@ class LiveBot:
         action, mod, msg = self.strategy.check_entry_signal(price, level)
 
         if action == "IMMEDIATE_ENTRY":
-            self.alert_signal(level['price'], "LIMIT / RESPONSIVE", mod, msg)
+            direction = "LONG" if level['type'] == 'SUP' else "SHORT"
+            self.alert_signal(level['price'], "LIMIT / RESPONSIVE", direction, mod, msg)
         elif action == "RECAPTURE_ENTRY":
-            self.alert_signal(price, "MARKET / RECAPTURE", mod, msg)
+            direction = "LONG" if level['type'] == 'SUP' else "SHORT"
+            self.alert_signal(price, "MARKET / RECAPTURE", direction, mod, msg)
 
-    def alert_signal(self, price, order_type, size_mod, message):
+    def alert_signal(self, price, order_type, direction, size_mod, message):
         """
         ✅ FIXED: Time-based deduplication (60-min cooldown for NQ)
         """
-        signal_key = f"{price:.2f}_{order_type}"
+        signal_key = f"{price:.2f}_{order_type}_{direction}"
         current_time = datetime.now()
 
-        # 60-minute cooldown (optimized from ES results)
+        # 60-minute cooldown (optimized from ES results) - FIXED: use total_seconds()
         if signal_key in self.active_signals:
             last_fired = self.active_signals[signal_key]
-            if (current_time - last_fired).seconds < 3600:  # 60 minutes
+            if (current_time - last_fired).total_seconds() < 3600:  # 60 minutes
                 return
 
+        # Emoji for direction
+        direction_emoji = "🟢" if direction == "LONG" else "🔴"
+
         print(f"\n{'='*60}")
-        print(f"🚀 NQ SIGNAL FIRED @ {price:.2f}")
+        print(f"🚀 {direction_emoji} {direction} NQ SIGNAL @ {price:.2f}")
         print(f"   Type: {order_type}")
         print(f"   Size: {size_mod}x")
         print(f"   Info: {message}")
@@ -721,7 +726,7 @@ class LiveBot:
 
         self.active_signals[signal_key] = current_time
 
-        logging.info(f"SIGNAL: {order_type} @ {price:.2f} | Size: {size_mod}x | {message}")
+        logging.info(f"SIGNAL: {direction} {order_type} @ {price:.2f} | Size: {size_mod}x | {message}")
 
     def start(self):
         """
