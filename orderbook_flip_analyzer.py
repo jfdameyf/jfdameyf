@@ -1,19 +1,58 @@
 """
 Order Book FLIP Analyzer
 Analyzes Level 2/3 order book data around FLIP signals to measure liquidity quality
+
+Required dependencies: pandas, numpy, databento, matplotlib, seaborn, pytz
+Install with: pip install pandas numpy databento matplotlib seaborn pytz
 """
 
-import pandas as pd
-import numpy as np
-import databento as db
+# Import standard library modules
 from datetime import datetime, timedelta
-import pytz
-import matplotlib.pyplot as plt
-import seaborn as sns
 from collections import defaultdict
 import logging
 
-NY_TZ = pytz.timezone('America/New_York')
+# Try importing required dependencies with helpful error messages
+try:
+    import pandas as pd
+except ImportError as e:
+    raise ImportError(
+        "pandas is required for OrderBookFlipAnalyzer. "
+        "Install with: pip install pandas"
+    ) from e
+
+try:
+    import numpy as np
+except ImportError as e:
+    raise ImportError(
+        "numpy is required for OrderBookFlipAnalyzer. "
+        "Install with: pip install numpy"
+    ) from e
+
+try:
+    import databento as db
+except ImportError as e:
+    raise ImportError(
+        "databento is required for OrderBookFlipAnalyzer. "
+        "Install with: pip install databento"
+    ) from e
+
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+except ImportError:
+    # Matplotlib/seaborn are only needed for plotting, allow import to succeed
+    plt = None
+    sns = None
+    logging.warning("matplotlib/seaborn not available - plotting will be disabled")
+
+try:
+    import pytz
+    NY_TZ = pytz.timezone('America/New_York')
+except ImportError:
+    # pytz is optional, can use UTC if not available
+    pytz = None
+    NY_TZ = None
+    logging.warning("pytz not available - using UTC for timestamps")
 
 
 class OrderBookFlipAnalyzer:
@@ -699,6 +738,12 @@ class OrderBookFlipAnalyzer:
         Args:
             save_path: Where to save the chart
         """
+        if plt is None or sns is None:
+            logging.warning("matplotlib/seaborn not available - skipping plot generation")
+            print("⚠️  matplotlib/seaborn not installed - cannot generate quality chart")
+            print("   Install with: pip install matplotlib seaborn")
+            return
+
         if not self.flip_analyses:
             logging.warning("No analyses to plot")
             return
