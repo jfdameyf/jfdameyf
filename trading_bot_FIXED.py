@@ -262,8 +262,9 @@ class StrategyManager:
         result_signal = "WAIT"
 
         # ✅ IMPROVED: Relaxed thresholds
+        # ✅ ADJUSTED: Blowout reduced to 10pts for realistic ES FLIP detection
         MIN_EXTENSION = 0.75  # Reduced from 1.5
-        BLOWOUT_THRESHOLD = 15.0  # Increased from 10.0
+        BLOWOUT_THRESHOLD = 10.0  # Reduced from 15.0 (8-10pts realistic for ES)
         RECLAIM_BUFFER = 0.50  # Increased from 0.25
 
         # --- LOGIC FOR SUPPORT (Long) ---
