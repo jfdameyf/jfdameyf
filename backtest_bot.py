@@ -228,17 +228,34 @@ class TradingBotBacktester:
         return strategy
 
     def _evaluate_bar(self, strategy, current_price, timestamp, plan):
-        """Evaluate a single price bar for signals"""
+        """
+        Evaluate a single price bar for signals
+
+        ✅ UPDATED: Now includes level state tracking for FLIP detection
+        """
         signals = []
         scan_range = 20.0  # Only check levels within 20 points
 
         # Track fired signals to prevent duplicates within same bar
         fired_this_bar = set()
 
+        # ✅ NEW: Track level states (required for FLIP detection)
+        # This monitors all levels and detects when they fail (creates FLIP monitors)
+
         # Check support levels
         for level in plan.get('levels', {}).get('raw_sup', []):
             if abs(current_price - level['price']) <= scan_range:
                 level['type'] = 'SUP'
+
+                # Update level state (tracks WATCHING → VIOLATED → FAILED)
+                # This is what creates FLIP monitors when levels blow out
+                strategy.detect_level_recapture(
+                    current_price,
+                    level['price'],
+                    level['type']
+                )
+
+                # Check for entry signals (RESPONSIVE, RECAPTURE, or FLIP)
                 signal = self._check_signal(strategy, current_price, level, timestamp)
 
                 if signal:
@@ -251,6 +268,15 @@ class TradingBotBacktester:
         for level in plan.get('levels', {}).get('raw_res', []):
             if abs(current_price - level['price']) <= scan_range:
                 level['type'] = 'RES'
+
+                # Update level state (tracks WATCHING → VIOLATED → FAILED)
+                strategy.detect_level_recapture(
+                    current_price,
+                    level['price'],
+                    level['type']
+                )
+
+                # Check for entry signals (RESPONSIVE, RECAPTURE, or FLIP)
                 signal = self._check_signal(strategy, current_price, level, timestamp)
 
                 if signal:
@@ -258,6 +284,35 @@ class TradingBotBacktester:
                     if signal_key not in fired_this_bar:
                         signals.append(signal)
                         fired_this_bar.add(signal_key)
+
+        # ✅ NEW: Also check FLIP monitors that were created from failed levels
+        # These are levels that failed and now we're watching for opposite-side tests
+        flip_levels_to_check = []
+
+        for key, monitor in strategy.active_monitors.items():
+            if monitor.get('is_flip', False) and monitor['state'] in ['WATCHING', 'VIOLATED']:
+                # This is a FLIP monitor - extract price and type
+                parts = key.split('_')
+                if len(parts) == 2:
+                    flip_price = float(parts[0])
+                    flip_type = parts[1]
+
+                    if abs(current_price - flip_price) <= scan_range:
+                        flip_levels_to_check.append({
+                            'price': flip_price,
+                            'type': flip_type,
+                            'is_flip': True
+                        })
+
+        # Check FLIP levels for signals
+        for flip_level in flip_levels_to_check:
+            signal = self._check_signal(strategy, current_price, flip_level, timestamp)
+
+            if signal:
+                signal_key = f"{signal['price']:.2f}_{signal['type']}"
+                if signal_key not in fired_this_bar:
+                    signals.append(signal)
+                    fired_this_bar.add(signal_key)
 
         return signals
 
