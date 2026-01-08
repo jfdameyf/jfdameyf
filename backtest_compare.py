@@ -76,6 +76,7 @@ class BacktestComparator:
                 'Avg/Day': len(signals) / max(len(data['daily_stats']), 1),
                 'Responsive': len(df[df['type']=='RESPONSIVE']) if not df.empty else 0,
                 'Recapture': len(df[df['type']=='RECAPTURE']) if not df.empty else 0,
+                'Flip': len(df[df['type']=='FLIP']) if not df.empty else 0,
                 'Zone 1': len(df[df['zone']==1]) if not df.empty else 0,
                 'Zone 2': len(df[df['zone']==2]) if not df.empty else 0,
                 'Zone 3': len(df[df['zone']==3]) if not df.empty else 0,
@@ -123,9 +124,10 @@ class BacktestComparator:
 
         # 3. Signal type breakdown
         x = np.arange(len(comp_df))
-        width = 0.35
-        axes[1, 0].bar(x - width/2, comp_df['Responsive'], width, label='Responsive', color='#2ecc71')
-        axes[1, 0].bar(x + width/2, comp_df['Recapture'], width, label='Recapture', color='#e74c3c')
+        width = 0.25
+        axes[1, 0].bar(x - width, comp_df['Responsive'], width, label='Responsive', color='#2ecc71')
+        axes[1, 0].bar(x, comp_df['Recapture'], width, label='Recapture', color='#e74c3c')
+        axes[1, 0].bar(x + width, comp_df['Flip'], width, label='Flip', color='#3498db')
         axes[1, 0].set_title('Signal Type Breakdown', fontweight='bold')
         axes[1, 0].set_ylabel('Signal Count')
         axes[1, 0].set_xticks(x)

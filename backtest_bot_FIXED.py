@@ -271,6 +271,17 @@ class TradingBotBacktester:
                 'message': message
             }
 
+        elif action == "FLIP_ENTRY":
+            signal = {
+                'time': timestamp,
+                'type': 'FLIP',
+                'direction': 'LONG' if level['type'] == 'SUP' else 'SHORT',
+                'price': current_price,
+                'zone': strategy.get_zone_number(level),
+                'size_mod': modifier,
+                'message': message
+            }
+
         # If signal fired, record timestamp
         if signal:
             self.last_signal_time[signal_key] = timestamp
@@ -301,6 +312,7 @@ class TradingBotBacktester:
         print(f"\n🎯 SIGNAL BREAKDOWN")
         print(f"   Responsive: {len(df[df['type']=='RESPONSIVE'])}")
         print(f"   Recapture: {len(df[df['type']=='RECAPTURE'])}")
+        print(f"   Flip: {len(df[df['type']=='FLIP'])}")
         print(f"\n   Long Signals: {len(df[df['direction']=='LONG'])}")
         print(f"   Short Signals: {len(df[df['direction']=='SHORT'])}")
 
