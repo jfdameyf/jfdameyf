@@ -1,6 +1,8 @@
 """
 ES Trading Bot Backtester
 Replays historical data to validate strategy performance
+
+✅ NOW INCLUDES: Order Book FLIP Analysis Integration
 """
 
 import pandas as pd
@@ -33,10 +35,11 @@ BACKTEST_OUTPUT = "backtest_results"
 os.makedirs(BACKTEST_OUTPUT, exist_ok=True)
 
 # ==============================================================================
-# BACKTESTER
+# BACKTESTER WITH ORDER BOOK INTEGRATION
 # ==============================================================================
 class TradingBotBacktester:
-    def __init__(self, start_date, end_date, enable_poc_filter=False):
+    def __init__(self, start_date, end_date, enable_poc_filter=False,
+                 analyze_orderbook=False, databento_api_key=None):
         """
         Initialize backtester
 
@@ -44,6 +47,8 @@ class TradingBotBacktester:
             start_date: datetime.date - First day to test
             end_date: datetime.date - Last day to test
             enable_poc_filter: bool - Enable POC distance filtering
+            analyze_orderbook: bool - Enable order book FLIP analysis (NEW)
+            databento_api_key: str - Databento API key for order book data (NEW)
         """
         self.start_date = start_date
         self.end_date = end_date
@@ -61,9 +66,32 @@ class TradingBotBacktester:
         self.signals = []
         self.daily_stats = {}
 
+        # ✅ INTEGRATION POINT 1: Order Book Analysis Setup
+        self.analyze_orderbook = analyze_orderbook
+        self.ob_analyzer = None
+
+        if analyze_orderbook:
+            if databento_api_key:
+                try:
+                    from orderbook_flip_analyzer import create_analyzer_from_api_key
+                    self.ob_analyzer = create_analyzer_from_api_key(
+                        databento_api_key,
+                        symbol=SYMBOL
+                    )
+                    print("✅ Order book analysis ENABLED")
+                except ImportError as e:
+                    print(f"⚠️  Could not import OrderBookFlipAnalyzer: {e}")
+                    print("   Order book analysis will be DISABLED")
+                    self.analyze_orderbook = False
+            else:
+                print("⚠️  Order book analysis requested but no API key provided")
+                print("   Pass databento_api_key parameter to enable")
+                self.analyze_orderbook = False
+
         print(f"🔬 BACKTESTER INITIALIZED")
         print(f"   Period: {start_date} to {end_date}")
         print(f"   POC Filter: {enable_poc_filter}")
+        print(f"   Order Book Analysis: {self.analyze_orderbook}")
         print(f"   Symbol: {SYMBOL}\n")
 
     def generate_historical_plans(self):
@@ -169,7 +197,14 @@ class TradingBotBacktester:
 
                 # Print signal details
                 for sig in day_signals:
-                    print(f"      🔔 {sig['time'].strftime('%H:%M')} | {sig['type']} @ {sig['price']:.2f} | Zone {sig['zone']}")
+                    sig_type = sig['type']
+                    # Add quality indicator for FLIP signals
+                    quality_str = ""
+                    if sig_type == 'FLIP' and 'orderbook' in sig:
+                        ob = sig['orderbook']
+                        quality_str = f" | Quality: {ob['quality_rating']} ({ob['quality_score']:.0f})"
+
+                    print(f"      🔔 {sig['time'].strftime('%H:%M')} | {sig_type} @ {sig['price']:.2f} | Zone {sig['zone']}{quality_str}")
 
             except Exception as e:
                 print(f"   ❌ Error: {e}")
@@ -227,7 +262,11 @@ class TradingBotBacktester:
         return signals
 
     def _check_signal(self, strategy, current_price, level, timestamp):
-        """Check if a level generates a signal"""
+        """
+        Check if a level generates a signal
+
+        ✅ INTEGRATION POINT 3: Process FLIP signals with order book analysis
+        """
         action, modifier, message = strategy.check_entry_signal(current_price, level)
 
         if action == "IMMEDIATE_ENTRY":
@@ -253,7 +292,7 @@ class TradingBotBacktester:
             }
 
         elif action == "FLIP_ENTRY":
-            return {
+            signal = {
                 'time': timestamp,
                 'type': 'FLIP',
                 'direction': 'LONG' if level['type'] == 'SUP' else 'SHORT',
@@ -263,10 +302,50 @@ class TradingBotBacktester:
                 'message': message
             }
 
+            # ✅ NEW: Order Book Analysis for FLIP signals
+            if self.analyze_orderbook and self.ob_analyzer:
+                try:
+                    # Process this FLIP signal through order book analyzer
+                    # NOTE: This requires that the level failure was tracked earlier
+                    # For now, we'll attempt analysis but it may return None if
+                    # the failure wasn't tracked (which requires deeper integration)
+
+                    ob_result = self.ob_analyzer.process_flip_signal(signal, timestamp)
+
+                    if ob_result:
+                        # Attach order book analysis to signal
+                        signal['orderbook'] = ob_result
+
+                        # Optional: Filter by quality
+                        # Uncomment to skip low-quality FLIPs:
+                        # if ob_result['recommendation'] == 'SKIP':
+                        #     print(f"      ⚠️  Low quality FLIP @ {current_price:.2f} (score: {ob_result['quality_score']:.1f}) - SKIPPED")
+                        #     return None
+
+                        # Log quality for debugging
+                        quality_rating = ob_result['quality_rating']
+                        quality_score = ob_result['quality_score']
+                        recommendation = ob_result['recommendation']
+
+                        if recommendation == 'SKIP':
+                            print(f"      ⚠️  FLIP quality: {quality_rating} ({quality_score:.1f}) - {recommendation}")
+                        else:
+                            print(f"      ✅ FLIP quality: {quality_rating} ({quality_score:.1f}) - {recommendation}")
+
+                except Exception as e:
+                    # Don't fail the backtest if order book analysis fails
+                    print(f"      ⚠️  Order book analysis error: {e}")
+
+            return signal
+
         return None
 
     def generate_report(self):
-        """Generate comprehensive backtest report"""
+        """
+        Generate comprehensive backtest report
+
+        ✅ INTEGRATION POINT 4: Add order book analysis report
+        """
         print("\n" + "="*60)
         print("📊 BACKTEST REPORT")
         print("="*60)
@@ -335,6 +414,7 @@ class TradingBotBacktester:
                 'avg_signals_per_day': len(df) / max(len(self.daily_stats), 1),
                 'responsive': int(len(df[df['type']=='RESPONSIVE'])),
                 'recapture': int(len(df[df['type']=='RECAPTURE'])),
+                'flip': int(len(df[df['type']=='FLIP'])),
                 'long': int(len(df[df['direction']=='LONG'])),
                 'short': int(len(df[df['direction']=='SHORT']))
             },
@@ -352,6 +432,32 @@ class TradingBotBacktester:
         with open(json_file, 'w') as f:
             json.dump(summary, f, indent=4)
         print(f"💾 Summary saved to: {json_file}")
+
+        # ✅ NEW: Order Book Analysis Report
+        if self.analyze_orderbook and self.ob_analyzer:
+            print("\n" + "="*60)
+            print("📊 ORDER BOOK FLIP ANALYSIS")
+            print("="*60)
+
+            # Generate summary report
+            df_ob = self.ob_analyzer.generate_summary_report()
+
+            if not df_ob.empty:
+                # Export detailed order book analysis
+                ob_csv_file = f"{BACKTEST_OUTPUT}/flip_orderbook_{self.start_date}_to_{self.end_date}.csv"
+                self.ob_analyzer.export_to_csv(ob_csv_file)
+                print(f"\n💾 Order book analysis saved to: {ob_csv_file}")
+
+                # Generate quality distribution chart
+                ob_chart_file = f"{BACKTEST_OUTPUT}/flip_quality_{self.start_date}_to_{self.end_date}.png"
+                try:
+                    self.ob_analyzer.plot_quality_distribution(ob_chart_file)
+                    print(f"📊 Quality chart saved to: {ob_chart_file}")
+                except Exception as e:
+                    print(f"⚠️  Could not generate quality chart: {e}")
+            else:
+                print("\n⚠️  No FLIP signals were analyzed (may need to implement failure tracking)")
+                print("   See ORDERBOOK_WORKFLOW.md for integration details")
 
         print("\n" + "="*60)
 
@@ -381,9 +487,9 @@ class TradingBotBacktester:
 
         # 2. Signal type distribution
         type_counts = df['type'].value_counts()
-        colors = ['#2ecc71', '#e74c3c']
+        colors = ['#2ecc71', '#e74c3c', '#3498db']  # Green, Red, Blue for RESPONSIVE, RECAPTURE, FLIP
         axes[0, 1].pie(type_counts.values, labels=type_counts.index, autopct='%1.1f%%',
-                       colors=colors, startangle=90)
+                       colors=colors[:len(type_counts)], startangle=90)
         axes[0, 1].set_title('Signal Type Distribution', fontweight='bold')
 
         # 3. Zone distribution
@@ -441,18 +547,26 @@ class TradingBotBacktester:
 # ==============================================================================
 # QUICK BACKTEST RUNNER
 # ==============================================================================
-def quick_backtest(days_back=7, enable_poc=False):
+def quick_backtest(days_back=7, enable_poc=False, enable_orderbook=False, ob_api_key=None):
     """
     Quick backtest for last N trading days
 
     Args:
         days_back: Number of trading days to test
         enable_poc: Enable POC distance filter
+        enable_orderbook: Enable order book FLIP analysis (NEW)
+        ob_api_key: Databento API key for order book data (NEW)
     """
     end_date = datetime.now(NY_TZ).date() - timedelta(days=1)  # Yesterday
     start_date = end_date - timedelta(days=days_back + 5)  # Add buffer for weekends
 
-    backtester = TradingBotBacktester(start_date, end_date, enable_poc)
+    backtester = TradingBotBacktester(
+        start_date,
+        end_date,
+        enable_poc,
+        analyze_orderbook=enable_orderbook,
+        databento_api_key=ob_api_key
+    )
     backtester.run_full_backtest()
 
     return backtester
@@ -464,6 +578,7 @@ def quick_backtest(days_back=7, enable_poc=False):
 if __name__ == "__main__":
     print("="*60)
     print("   ES TRADING BOT BACKTESTER")
+    print("   ✅ WITH ORDER BOOK FLIP ANALYSIS")
     print("="*60)
     print("\n1. Quick Backtest (Last 7 trading days)")
     print("2. Quick Backtest (Last 30 trading days)")
@@ -473,14 +588,22 @@ if __name__ == "__main__":
     choice = input("\nSelect Option [1-4]: ").strip()
 
     enable_poc = input("Enable POC Filter? [y/N]: ").strip().lower() == 'y'
+    enable_ob = input("Enable Order Book Analysis? [y/N]: ").strip().lower() == 'y'
+
+    ob_key = None
+    if enable_ob:
+        ob_key = input("Enter Databento API Key (or press Enter to skip): ").strip()
+        if not ob_key:
+            print("⚠️  No API key provided, order book analysis will be disabled")
+            enable_ob = False
 
     if choice == "1":
         print("\n🔬 Running 7-Day Backtest...")
-        quick_backtest(days_back=7, enable_poc=enable_poc)
+        quick_backtest(days_back=7, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key)
 
     elif choice == "2":
         print("\n🔬 Running 30-Day Backtest...")
-        quick_backtest(days_back=30, enable_poc=enable_poc)
+        quick_backtest(days_back=30, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key)
 
     elif choice == "3":
         start_str = input("Start Date (YYYY-MM-DD): ").strip()
@@ -490,14 +613,20 @@ if __name__ == "__main__":
             start = datetime.strptime(start_str, "%Y-%m-%d").date()
             end = datetime.strptime(end_str, "%Y-%m-%d").date()
 
-            backtester = TradingBotBacktester(start, end, enable_poc)
+            backtester = TradingBotBacktester(
+                start,
+                end,
+                enable_poc,
+                analyze_orderbook=enable_ob,
+                databento_api_key=ob_key
+            )
             backtester.run_full_backtest()
         except ValueError:
             print("❌ Invalid date format!")
 
     elif choice == "4":
         print("\n🔬 Running 90-Day Backtest (this may take a while)...")
-        quick_backtest(days_back=90, enable_poc=enable_poc)
+        quick_backtest(days_back=90, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key)
 
     else:
         print("❌ Invalid choice")
