@@ -252,7 +252,8 @@ class TradingBotBacktester:
                 strategy.detect_level_recapture(
                     current_price,
                     level['price'],
-                    level['type']
+                    level['type'],
+                    timestamp  # ✅ NEW: Pass timestamp for time-based FLIP filtering
                 )
 
                 # Check for entry signals (RESPONSIVE, RECAPTURE, or FLIP)
@@ -273,7 +274,8 @@ class TradingBotBacktester:
                 strategy.detect_level_recapture(
                     current_price,
                     level['price'],
-                    level['type']
+                    level['type'],
+                    timestamp  # ✅ NEW: Pass timestamp for time-based FLIP filtering
                 )
 
                 # Check for entry signals (RESPONSIVE, RECAPTURE, or FLIP)
@@ -306,6 +308,14 @@ class TradingBotBacktester:
 
         # Check FLIP levels for signals
         for flip_level in flip_levels_to_check:
+            # ✅ NEW: Update FLIP monitor state with timestamp
+            strategy.detect_level_recapture(
+                current_price,
+                flip_level['price'],
+                flip_level['type'],
+                timestamp  # Pass timestamp for time-based FLIP filtering
+            )
+
             signal = self._check_signal(strategy, current_price, flip_level, timestamp)
 
             if signal:

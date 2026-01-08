@@ -239,16 +239,28 @@ class StrategyManager:
 
         return "NO_TRADE", 0.0, "Unknown Zone"
 
-    def detect_level_recapture(self, current_price, level_price, level_type):
+    def detect_level_recapture(self, current_price, level_price, level_type, timestamp=None):
         """
         Logic: Violation -> Extension -> Reclaim.
         ✅ IMPROVED: Relaxed thresholds for better signal generation
         ✅ NEW: Support/Resistance FLIP detection when levels FAIL
+        ✅ ENHANCED: Time-based filtering for more reliable FLIP detection
 
-        When a level FAILS (blowout > 15pts):
+        When a level FAILS (blowout > 10pts AND time > 30min):
         - Old RES becomes potential new SUP (if price returns from above)
         - Old SUP becomes potential new RES (if price returns from below)
         - Same extension/reclaim requirements apply
+
+        Time filtering prevents fake-outs from:
+        - Quick news spikes that immediately reverse
+        - High volatility candles that just take liquidity
+        - False breakouts that don't represent structural change
+
+        Args:
+            current_price: Current market price
+            level_price: The level being monitored
+            level_type: 'SUP' or 'RES'
+            timestamp: Current timestamp (for time-based FLIP filtering)
         """
         key = f"{level_price:.2f}_{level_type}"
         state_changed = False
@@ -263,9 +275,11 @@ class StrategyManager:
 
         # ✅ IMPROVED: Relaxed thresholds
         # ✅ ADJUSTED: Blowout reduced to 10pts for realistic ES FLIP detection
+        # ✅ NEW: Time-based filtering for more reliable FLIP detection
         MIN_EXTENSION = 0.75  # Reduced from 1.5
         BLOWOUT_THRESHOLD = 10.0  # Reduced from 15.0 (8-10pts realistic for ES)
         RECLAIM_BUFFER = 0.50  # Increased from 0.25
+        TIME_BEYOND_THRESHOLD = 30 * 60  # 30 minutes in seconds (prevents fake-outs)
 
         # --- LOGIC FOR SUPPORT (Long) ---
         if level_type == 'SUP':
@@ -275,6 +289,9 @@ class StrategyManager:
                 if current_price < level_price:
                     monitor['state'] = 'VIOLATED'
                     monitor['extension'] = float(violation_dist)
+                    # ✅ NEW: Track when violation first occurred (for time-based FLIP filtering)
+                    if timestamp:
+                        monitor['violation_timestamp'] = timestamp
                     state_changed = True
                     result_signal = "WAITING_FOR_RECLAIM"
                     flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
@@ -286,12 +303,19 @@ class StrategyManager:
                         monitor['extension'] = float(violation_dist)
                         state_changed = True
 
-                    if violation_dist > BLOWOUT_THRESHOLD:  # Blowout (Trend)
+                    # ✅ NEW: Check BOTH distance and time thresholds before marking FAILED
+                    # Calculate time spent beyond level
+                    time_beyond = 0
+                    if timestamp and 'violation_timestamp' in monitor:
+                        time_beyond = (timestamp - monitor['violation_timestamp']).total_seconds()
+
+                    # Only mark FAILED if BOTH thresholds met (distance AND time)
+                    if violation_dist > BLOWOUT_THRESHOLD and time_beyond >= TIME_BEYOND_THRESHOLD:
                         monitor['state'] = 'FAILED'
                         state_changed = True
                         result_signal = "CANCEL"
                         flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
-                        logging.info(f"Monitor {key}{flip_tag}: FAILED (blowout: {violation_dist:.2f})")
+                        logging.info(f"Monitor {key}{flip_tag}: FAILED (blowout: {violation_dist:.2f}, time: {time_beyond/60:.1f}min)")
 
                         # ✅ NEW: Create FLIP monitor (broken SUP becomes potential RES)
                         if not monitor.get('is_flip', False):  # Don't flip a flip
@@ -332,6 +356,9 @@ class StrategyManager:
                 if current_price > level_price:
                     monitor['state'] = 'VIOLATED'
                     monitor['extension'] = float(violation_dist)
+                    # ✅ NEW: Track when violation first occurred (for time-based FLIP filtering)
+                    if timestamp:
+                        monitor['violation_timestamp'] = timestamp
                     state_changed = True
                     result_signal = "WAITING_FOR_RECLAIM"
                     flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
@@ -343,12 +370,19 @@ class StrategyManager:
                         monitor['extension'] = float(violation_dist)
                         state_changed = True
 
-                    if violation_dist > BLOWOUT_THRESHOLD:
+                    # ✅ NEW: Check BOTH distance and time thresholds before marking FAILED
+                    # Calculate time spent beyond level
+                    time_beyond = 0
+                    if timestamp and 'violation_timestamp' in monitor:
+                        time_beyond = (timestamp - monitor['violation_timestamp']).total_seconds()
+
+                    # Only mark FAILED if BOTH thresholds met (distance AND time)
+                    if violation_dist > BLOWOUT_THRESHOLD and time_beyond >= TIME_BEYOND_THRESHOLD:
                         monitor['state'] = 'FAILED'
                         state_changed = True
                         result_signal = "CANCEL"
                         flip_tag = " [FLIP]" if monitor.get('is_flip', False) else ""
-                        logging.info(f"Monitor {key}{flip_tag}: FAILED (blowout: {violation_dist:.2f})")
+                        logging.info(f"Monitor {key}{flip_tag}: FAILED (blowout: {violation_dist:.2f}, time: {time_beyond/60:.1f}min)")
 
                         # ✅ NEW: Create FLIP monitor (broken RES becomes potential SUP)
                         if not monitor.get('is_flip', False):  # Don't flip a flip
