@@ -72,6 +72,16 @@ class TradingBotBacktester:
         # Track last signal time per level (session-wide)
         self.last_signal_time = {}
 
+        # ✅ NEW: Trade tracking with MAE/MFE
+        self.open_position = None  # Current open trade
+        self.TARGET_PROFIT = target_points  # From constructor (10.0 for NQ)
+        self.STOP_LOSS = stop_points  # From constructor (6.0 for NQ)
+
+        # ✅ NEW: Dynamic SUP/RES tracking
+        self.previous_close = None  # Track previous bar's close to determine approach direction
+        self.level_last_signal = {}  # {level_price: {'direction': 'LONG/SHORT', 'timestamp': dt, 'price': float}}
+        self.WHIPSAW_PREVENTION_DISTANCE = 10.0  # Don't fire opposite signal within 10 points (NQ)
+
         print(f"🔬 NQ BACKTESTER INITIALIZED (COMPLETE VERSION)")
         print(f"   Period: {start_date} to {end_date}")
         print(f"   POC Filter: {enable_poc_filter}")
@@ -130,6 +140,10 @@ class TradingBotBacktester:
             # Reset signal tracking at start of each day
             self.last_signal_time = {}
 
+            # ✅ NEW: Reset tracking variables for new day
+            self.previous_close = None  # Reset for new session
+            self.level_last_signal = {}  # Clear previous day's signals
+
             # Parse date
             test_date = datetime.strptime(date_str, '%Y-%m-%d').date()
 
@@ -164,13 +178,14 @@ class TradingBotBacktester:
 
                 # Track day stats
                 day_signals = []
-                day_trades = []
                 tick_count = 0
 
                 # Replay each bar
                 for idx, (timestamp, bar) in enumerate(bars.iterrows()):
                     tick_count += 1
                     current_price = bar['close']
+                    bar_high = bar['high']
+                    bar_low = bar['low']
 
                     # ✅ ADDITIONAL CHECK: Verify timestamp is within RTH
                     hour = timestamp.hour
@@ -179,24 +194,27 @@ class TradingBotBacktester:
                     if not (9 <= hour < 16 or (hour == 9 and minute >= 30)):
                         continue  # Skip non-RTH bars
 
+                    # ✅ NEW: Update open position MAE/MFE
+                    if self.open_position:
+                        self._update_trade_metrics(bar_high, bar_low, current_price, timestamp)
+
                     # Check all levels for signals
                     signals_this_bar = self._evaluate_bar(
                         strategy, current_price, timestamp, plan
                     )
 
-                    for signal in signals_this_bar:
-                        # Calculate MFE/MAE for this signal
-                        trade_outcome = self._calculate_trade_outcome(
-                            signal, bars, idx, timestamp
-                        )
+                    day_signals.extend(signals_this_bar)
 
-                        if trade_outcome:
-                            day_signals.append(signal)
-                            day_trades.append(trade_outcome)
+                    # ✅ NEW: Process signals as trade entries
+                    for signal in signals_this_bar:
+                        self._process_signal_as_trade(signal, current_price, timestamp)
+
+                # ✅ NEW: Close any open position at end of day
+                if self.open_position:
+                    self._close_trade(bars['close'].iloc[-1], bars.index[-1], reason="EOD")
 
                 # Store results
                 self.signals.extend(day_signals)
-                self.trades.extend(day_trades)
 
                 self.daily_stats[date_str] = {
                     'signals': len(day_signals),
@@ -204,14 +222,10 @@ class TradingBotBacktester:
                     'high': bars['high'].max(),
                     'low': bars['low'].min(),
                     'close': bars['close'].iloc[-1],
-                    'range': bars['high'].max() - bars['low'].min(),
-                    'winners': sum(1 for t in day_trades if t['outcome'] == 'WIN'),
-                    'losers': sum(1 for t in day_trades if t['outcome'] == 'LOSS')
+                    'range': bars['high'].max() - bars['low'].min()
                 }
 
-                win_rate = (self.daily_stats[date_str]['winners'] / len(day_signals) * 100) if day_signals else 0
-
-                print(f"   ✅ {len(day_signals)} signals | Range: {self.daily_stats[date_str]['range']:.2f}pts | Win Rate: {win_rate:.0f}%")
+                print(f"   ✅ {len(day_signals)} signals | Range: {self.daily_stats[date_str]['range']:.2f}pts")
 
                 # Print signal details (RTH only)
                 for sig in day_signals[:5]:  # Show first 5
@@ -242,29 +256,126 @@ class TradingBotBacktester:
         return strategy
 
     def _evaluate_bar(self, strategy, current_price, timestamp, plan):
-        """Evaluate a single price bar with strict cooldown"""
+        """
+        Evaluate a single price bar for signals
+
+        ✅ NEW APPROACH: Dynamic SUP/RES designation based on approach direction
+        - Levels are treated fluidly - type determined by price approach direction
+        - If approaching from below → level acts as RESISTANCE (sell)
+        - If approaching from above → level acts as SUPPORT (buy)
+        - Whipsaw prevention: don't fire opposite signals in close proximity
+        """
         signals = []
         scan_range = 80.0  # NQ: 80pts (ES was 20pts)
 
-        # Check support levels
-        for level in plan.get('levels', {}).get('raw_sup', []):
-            if abs(current_price - level['price']) <= scan_range:
-                level['type'] = 'SUP'
-                signal = self._check_signal_with_cooldown(
-                    strategy, current_price, level, timestamp
-                )
-                if signal:
-                    signals.append(signal)
+        # Track fired signals to prevent duplicates within same bar
+        fired_this_bar = set()
 
-        # Check resistance levels
+        # ✅ NEW: Combine all levels (SUP + RES) into one array
+        # We'll dynamically assign type based on approach direction
+        all_levels = []
+
+        # Get support levels
+        for level in plan.get('levels', {}).get('raw_sup', []):
+            all_levels.append({
+                'price': level['price'],
+                'zone': level.get('zone', 0),
+                'original_type': 'SUP'  # Track original designation for reference
+            })
+
+        # Get resistance levels
         for level in plan.get('levels', {}).get('raw_res', []):
-            if abs(current_price - level['price']) <= scan_range:
-                level['type'] = 'RES'
-                signal = self._check_signal_with_cooldown(
-                    strategy, current_price, level, timestamp
-                )
-                if signal:
-                    signals.append(signal)
+            all_levels.append({
+                'price': level['price'],
+                'zone': level.get('zone', 0),
+                'original_type': 'RES'  # Track original designation for reference
+            })
+
+        # Check each level
+        for level in all_levels:
+            level_price = level['price']
+
+            # Only check levels within scan range
+            if abs(current_price - level_price) > scan_range:
+                continue
+
+            # ✅ DYNAMIC SUP/RES DESIGNATION
+            # Determine approach direction using previous bar's price
+            if self.previous_close is not None:
+                # Determine if we're approaching from above or below
+                prev_distance = abs(self.previous_close - level_price)
+                curr_distance = abs(current_price - level_price)
+
+                # Are we getting closer to the level?
+                approaching = curr_distance < prev_distance
+
+                if approaching:
+                    # Price is approaching - determine from which direction
+                    if current_price < level_price:
+                        # Approaching from below → level acts as RESISTANCE (sell)
+                        level['type'] = 'RES'
+                        expected_direction = 'SHORT'
+                    else:
+                        # Approaching from above → level acts as SUPPORT (buy)
+                        level['type'] = 'SUP'
+                        expected_direction = 'LONG'
+                else:
+                    # Not approaching - use position relative to level
+                    if current_price < level_price:
+                        # Below level → it acts as RESISTANCE (sell when we touch it)
+                        level['type'] = 'RES'
+                        expected_direction = 'SHORT'
+                    else:
+                        # Above level → it acts as SUPPORT (buy when we touch it)
+                        level['type'] = 'SUP'
+                        expected_direction = 'LONG'
+            else:
+                # First bar - use simple position-based logic
+                if current_price < level_price:
+                    level['type'] = 'RES'
+                    expected_direction = 'SHORT'
+                else:
+                    level['type'] = 'SUP'
+                    expected_direction = 'LONG'
+
+            # ✅ WHIPSAW PREVENTION
+            # Don't fire opposite signal if we just fired the other direction at this level
+            level_key = f"{level_price:.2f}"
+            if level_key in self.level_last_signal:
+                last_sig = self.level_last_signal[level_key]
+                last_direction = last_sig['direction']
+                last_price = last_sig['price']
+
+                # Check if we're trying to fire opposite direction
+                if expected_direction != last_direction:
+                    # Check if we're still in whipsaw zone
+                    if abs(current_price - last_price) <= self.WHIPSAW_PREVENTION_DISTANCE:
+                        # Skip - too close to opposite signal
+                        continue
+
+            # Check for entry signal (with cooldown)
+            signal = self._check_signal_with_cooldown(strategy, current_price, level, timestamp)
+
+            if signal:
+                signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
+
+                # Check per-bar deduplication
+                if signal_key in fired_this_bar:
+                    continue
+
+                # Signal passed all checks
+                signals.append(signal)
+                fired_this_bar.add(signal_key)
+
+                # Track this signal for whipsaw prevention
+                self.level_last_signal[level_key] = {
+                    'direction': signal['direction'],
+                    'timestamp': timestamp,
+                    'price': current_price
+                }
+
+        # Update previous close for next bar
+        self.previous_close = current_price
 
         return signals
 
@@ -506,54 +617,72 @@ class TradingBotBacktester:
             pct = (count / len(df_signals)) * 100
             print(f"   Zone {zone}: {count} ({pct:.1f}%)")
 
-        # ✅ NEW: TRADE PERFORMANCE
+        # ✅ NEW: TRADE RESULTS REPORT
         if not df_trades.empty:
-            wins = len(df_trades[df_trades['outcome'] == 'WIN'])
-            losses = len(df_trades[df_trades['outcome'] == 'LOSS'])
-            scratches = len(df_trades[df_trades['outcome'] == 'SCRATCH'])
+            print("\n" + "="*60)
+            print("💰 TRADE RESULTS (MAE/MFE ANALYSIS)")
+            print("="*60)
+
+            # Overall trade stats
             total_trades = len(df_trades)
+            winning_trades = len(df_trades[df_trades['pnl'] > 0])
+            losing_trades = len(df_trades[df_trades['pnl'] < 0])
+            breakeven_trades = len(df_trades[df_trades['pnl'] == 0])
 
-            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
 
-            avg_win = df_trades[df_trades['pnl'] > 0]['pnl'].mean() if wins > 0 else 0
-            avg_loss = df_trades[df_trades['pnl'] < 0]['pnl'].mean() if losses > 0 else 0
+            print(f"\n📊 PERFORMANCE METRICS")
+            print(f"   Total Trades: {total_trades}")
+            print(f"   Winners: {winning_trades} ({win_rate:.1f}%)")
+            print(f"   Losers: {losing_trades}")
+            print(f"   Breakeven: {breakeven_trades}")
 
+            # P&L Stats
             total_pnl = df_trades['pnl'].sum()
             avg_pnl = df_trades['pnl'].mean()
+            avg_winner = df_trades[df_trades['pnl'] > 0]['pnl'].mean() if winning_trades > 0 else 0
+            avg_loser = df_trades[df_trades['pnl'] < 0]['pnl'].mean() if losing_trades > 0 else 0
 
-            print(f"\n💰 TRADE PERFORMANCE")
-            print(f"   Total Trades: {total_trades}")
-            print(f"   Winners: {wins} ({win_rate:.1f}%)")
-            print(f"   Losers: {losses} ({(losses/total_trades*100):.1f}%)")
-            print(f"   Scratches: {scratches} ({(scratches/total_trades*100):.1f}%)")
-            print(f"\n   Avg Win: {avg_win:.2f} pts (${avg_win * 20:.0f})")
-            print(f"   Avg Loss: {avg_loss:.2f} pts (${avg_loss * 20:.0f})")
-            print(f"   Win/Loss Ratio: {abs(avg_win/avg_loss):.2f}" if avg_loss != 0 else "   Win/Loss Ratio: N/A")
-            print(f"\n   Total P&L: {total_pnl:.2f} pts (${total_pnl * 20:.0f})")
-            print(f"   Avg P&L/Trade: {avg_pnl:.2f} pts (${avg_pnl * 20:.0f})")
-            print(f"   Expectancy: ${avg_pnl * 20:.2f} per trade")
+            print(f"\n💵 PROFIT & LOSS")
+            print(f"   Total P&L: {total_pnl:.2f} pts (${total_pnl * 20:.2f})")
+            print(f"   Avg P&L: {avg_pnl:.2f} pts")
+            print(f"   Avg Winner: {avg_winner:.2f} pts")
+            print(f"   Avg Loser: {avg_loser:.2f} pts")
+            if avg_loser != 0:
+                profit_factor = abs(avg_winner / avg_loser)
+                print(f"   Profit Factor: {profit_factor:.2f}")
 
-            # MFE/MAE Analysis
-            avg_mfe = df_trades['mfe'].mean()
-            avg_mae = df_trades['mae'].mean()
-            avg_efficiency = df_trades['efficiency'].mean()
+            # MAE/MFE Stats
+            print(f"\n📉 MAE/MFE ANALYSIS")
+            print(f"   Avg MAE (Max Adverse): {df_trades['mae'].mean():.2f} pts")
+            print(f"   Avg MFE (Max Favorable): {df_trades['mfe'].mean():.2f} pts")
+            print(f"   Max MAE: {df_trades['mae'].max():.2f} pts")
+            print(f"   Max MFE: {df_trades['mfe'].max():.2f} pts")
 
-            print(f"\n📊 MFE/MAE ANALYSIS")
-            print(f"   Avg MFE (Max Favorable): {avg_mfe:.2f} pts")
-            print(f"   Avg MAE (Max Adverse): {avg_mae:.2f} pts")
-            print(f"   Avg Capture Efficiency: {avg_efficiency:.1f}%")
-            print(f"   MFE/MAE Ratio: {avg_mfe/avg_mae:.2f}" if avg_mae > 0 else "   MFE/MAE Ratio: N/A")
+            # Exit reason breakdown
+            print(f"\n🚪 EXIT REASONS")
+            for reason, count in df_trades['exit_reason'].value_counts().items():
+                pct = (count / total_trades) * 100
+                print(f"   {reason}: {count} ({pct:.1f}%)")
 
-            # Zone performance
-            print(f"\n🎯 PERFORMANCE BY ZONE")
-            for zone in sorted(df_trades['zone'].unique()):
-                zone_trades = df_trades[df_trades['zone'] == zone]
-                zone_wins = len(zone_trades[zone_trades['outcome'] == 'WIN'])
-                zone_total = len(zone_trades)
-                zone_wr = (zone_wins / zone_total * 100) if zone_total > 0 else 0
-                zone_pnl = zone_trades['pnl'].sum()
+            # Duration stats
+            print(f"\n⏱️  TRADE DURATION")
+            print(f"   Avg: {df_trades['duration_minutes'].mean():.1f} minutes")
+            print(f"   Min: {df_trades['duration_minutes'].min():.1f} minutes")
+            print(f"   Max: {df_trades['duration_minutes'].max():.1f} minutes")
 
-                print(f"   Zone {zone}: {zone_total} trades, {zone_wr:.0f}% WR, {zone_pnl:+.1f} pts")
+            # Direction breakdown
+            print(f"\n🎯 DIRECTION BREAKDOWN")
+            for direction in ['LONG', 'SHORT']:
+                dir_trades = df_trades[df_trades['direction'] == direction]
+                if len(dir_trades) > 0:
+                    dir_pnl = dir_trades['pnl'].sum()
+                    dir_wins = len(dir_trades[dir_trades['pnl'] > 0])
+                    dir_wr = (dir_wins / len(dir_trades)) * 100
+                    print(f"   {direction}: {len(dir_trades)} trades | {dir_pnl:.2f} pts | {dir_wr:.1f}% WR")
+
+        else:
+            print("\n⚠️  No trades executed (signals may not have met entry criteria)")
 
         # Quality assessment
         avg_per_day = len(df_signals) / max(len(self.daily_stats), 1)
@@ -724,6 +853,155 @@ class TradingBotBacktester:
         print("\n" + "="*60)
         print("✅ NQ BACKTEST COMPLETE!")
         print("="*60)
+
+    def _process_signal_as_trade(self, signal, current_price, timestamp):
+        """
+        Process a signal as a trade entry
+
+        Handles:
+        - Opening new position if no position open
+        - Flipping position if opposite signal
+        - Ignoring signal if same direction already open
+        """
+        signal_direction = signal['direction']  # 'LONG' or 'SHORT'
+
+        # If no position, open new trade
+        if self.open_position is None:
+            self.open_position = {
+                'direction': signal_direction,
+                'entry_price': current_price,
+                'entry_time': timestamp,
+                'entry_signal': signal,
+                'mae': 0.0,  # Maximum Adverse Excursion
+                'mfe': 0.0,  # Maximum Favorable Excursion
+                'running_pnl': 0.0
+            }
+            return
+
+        # If opposite signal, close current and open new
+        if signal_direction != self.open_position['direction']:
+            # Close existing position
+            self._close_trade(current_price, timestamp, reason="FLIP")
+
+            # Open new position in opposite direction
+            self.open_position = {
+                'direction': signal_direction,
+                'entry_price': current_price,
+                'entry_time': timestamp,
+                'entry_signal': signal,
+                'mae': 0.0,
+                'mfe': 0.0,
+                'running_pnl': 0.0
+            }
+
+        # If same direction signal, ignore (already in trade)
+
+    def _update_trade_metrics(self, bar_high, bar_low, bar_close, timestamp):
+        """
+        Update MAE/MFE for open position based on current bar
+
+        MAE: Maximum Adverse Excursion (worst drawdown)
+        MFE: Maximum Favorable Excursion (best profit)
+        """
+        if not self.open_position:
+            return
+
+        entry_price = self.open_position['entry_price']
+        direction = self.open_position['direction']
+
+        if direction == 'LONG':
+            # For long trades
+            # MFE is highest point above entry
+            # MAE is lowest point below entry
+            favorable_move = bar_high - entry_price
+            adverse_move = entry_price - bar_low
+
+            # Track running P&L
+            self.open_position['running_pnl'] = bar_close - entry_price
+
+            # Update MFE (max profit)
+            if favorable_move > self.open_position['mfe']:
+                self.open_position['mfe'] = favorable_move
+
+            # Update MAE (max loss)
+            if adverse_move > self.open_position['mae']:
+                self.open_position['mae'] = adverse_move
+
+            # Check stop/target
+            if adverse_move >= self.STOP_LOSS:
+                self._close_trade(entry_price - self.STOP_LOSS, timestamp, reason="STOP")
+            elif favorable_move >= self.TARGET_PROFIT:
+                self._close_trade(entry_price + self.TARGET_PROFIT, timestamp, reason="TARGET")
+
+        else:  # SHORT
+            # For short trades
+            # MFE is lowest point below entry
+            # MAE is highest point above entry
+            favorable_move = entry_price - bar_low
+            adverse_move = bar_high - entry_price
+
+            # Track running P&L
+            self.open_position['running_pnl'] = entry_price - bar_close
+
+            # Update MFE (max profit)
+            if favorable_move > self.open_position['mfe']:
+                self.open_position['mfe'] = favorable_move
+
+            # Update MAE (max loss)
+            if adverse_move > self.open_position['mae']:
+                self.open_position['mae'] = adverse_move
+
+            # Check stop/target
+            if adverse_move >= self.STOP_LOSS:
+                self._close_trade(entry_price + self.STOP_LOSS, timestamp, reason="STOP")
+            elif favorable_move >= self.TARGET_PROFIT:
+                self._close_trade(entry_price - self.TARGET_PROFIT, timestamp, reason="TARGET")
+
+    def _close_trade(self, exit_price, exit_time, reason="MANUAL"):
+        """
+        Close open position and record trade results
+
+        Args:
+            exit_price: Price at which trade exits
+            exit_time: Timestamp of exit
+            reason: Exit reason (STOP/TARGET/EOD/FLIP/MANUAL)
+        """
+        if not self.open_position:
+            return
+
+        # Calculate final P&L
+        entry_price = self.open_position['entry_price']
+        direction = self.open_position['direction']
+
+        if direction == 'LONG':
+            pnl = exit_price - entry_price
+        else:  # SHORT
+            pnl = entry_price - exit_price
+
+        # Calculate trade duration
+        duration = (exit_time - self.open_position['entry_time']).total_seconds() / 60  # minutes
+
+        # Record completed trade
+        trade_record = {
+            'entry_time': self.open_position['entry_time'],
+            'exit_time': exit_time,
+            'duration_minutes': duration,
+            'direction': direction,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'pnl': pnl,
+            'mae': self.open_position['mae'],  # Max loss during trade
+            'mfe': self.open_position['mfe'],  # Max profit during trade
+            'exit_reason': reason,
+            'entry_signal_type': self.open_position['entry_signal']['type'],
+            'entry_zone': self.open_position['entry_signal']['zone'],
+            'entry_level_price': self.open_position['entry_signal']['price']
+        }
+
+        self.trades.append(trade_record)
+
+        # Clear open position
+        self.open_position = None
 
 
 # ==============================================================================

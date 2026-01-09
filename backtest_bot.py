@@ -66,6 +66,12 @@ class TradingBotBacktester:
         self.signals = []
         self.daily_stats = {}
 
+        # ✅ NEW: Trade tracking with MAE/MFE
+        self.trades = []  # All completed trades
+        self.open_position = None  # Current open trade
+        self.TARGET_PROFIT = 5.0  # 5 points target for ES
+        self.STOP_LOSS = 2.0  # 2 points stop for ES
+
         # ✅ FIX 2: Session-wide signal deduplication
         self.fired_signals_session = {}  # {signal_key: timestamp}
         self.SIGNAL_COOLDOWN_MINUTES = 15  # Don't repeat same signal within 15 min
@@ -187,6 +193,12 @@ class TradingBotBacktester:
                 for timestamp, bar in bars.iterrows():
                     tick_count += 1
                     current_price = bar['close']
+                    bar_high = bar['high']
+                    bar_low = bar['low']
+
+                    # ✅ NEW: Update open position MAE/MFE
+                    if self.open_position:
+                        self._update_trade_metrics(bar_high, bar_low, current_price, timestamp)
 
                     # Check all levels
                     signals_this_bar = self._evaluate_bar(
@@ -194,6 +206,14 @@ class TradingBotBacktester:
                     )
 
                     day_signals.extend(signals_this_bar)
+
+                    # ✅ NEW: Process signals as trade entries
+                    for signal in signals_this_bar:
+                        self._process_signal_as_trade(signal, current_price, timestamp)
+
+                # ✅ NEW: Close any open position at end of day
+                if self.open_position:
+                    self._close_trade(bars['close'].iloc[-1], bars.index[-1], reason="EOD")
 
                 # Store results
                 self.signals.extend(day_signals)
@@ -545,6 +565,80 @@ class TradingBotBacktester:
             json.dump(summary, f, indent=4)
         print(f"💾 Summary saved to: {json_file}")
 
+        # ✅ NEW: Trade Results Report
+        if self.trades:
+            print("\n" + "="*60)
+            print("💰 TRADE RESULTS (MAE/MFE ANALYSIS)")
+            print("="*60)
+
+            trades_df = pd.DataFrame(self.trades)
+
+            # Overall trade stats
+            total_trades = len(trades_df)
+            winning_trades = len(trades_df[trades_df['pnl'] > 0])
+            losing_trades = len(trades_df[trades_df['pnl'] < 0])
+            breakeven_trades = len(trades_df[trades_df['pnl'] == 0])
+
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+            print(f"\n📊 PERFORMANCE METRICS")
+            print(f"   Total Trades: {total_trades}")
+            print(f"   Winners: {winning_trades} ({win_rate:.1f}%)")
+            print(f"   Losers: {losing_trades}")
+            print(f"   Breakeven: {breakeven_trades}")
+
+            # P&L Stats
+            total_pnl = trades_df['pnl'].sum()
+            avg_pnl = trades_df['pnl'].mean()
+            avg_winner = trades_df[trades_df['pnl'] > 0]['pnl'].mean() if winning_trades > 0 else 0
+            avg_loser = trades_df[trades_df['pnl'] < 0]['pnl'].mean() if losing_trades > 0 else 0
+
+            print(f"\n💵 PROFIT & LOSS")
+            print(f"   Total P&L: {total_pnl:.2f} pts (${total_pnl * 50:.2f})")
+            print(f"   Avg P&L: {avg_pnl:.2f} pts")
+            print(f"   Avg Winner: {avg_winner:.2f} pts")
+            print(f"   Avg Loser: {avg_loser:.2f} pts")
+            if avg_loser != 0:
+                profit_factor = abs(avg_winner / avg_loser)
+                print(f"   Profit Factor: {profit_factor:.2f}")
+
+            # MAE/MFE Stats
+            print(f"\n📉 MAE/MFE ANALYSIS")
+            print(f"   Avg MAE (Max Adverse): {trades_df['mae'].mean():.2f} pts")
+            print(f"   Avg MFE (Max Favorable): {trades_df['mfe'].mean():.2f} pts")
+            print(f"   Max MAE: {trades_df['mae'].max():.2f} pts")
+            print(f"   Max MFE: {trades_df['mfe'].max():.2f} pts")
+
+            # Exit reason breakdown
+            print(f"\n🚪 EXIT REASONS")
+            for reason, count in trades_df['exit_reason'].value_counts().items():
+                pct = (count / total_trades) * 100
+                print(f"   {reason}: {count} ({pct:.1f}%)")
+
+            # Duration stats
+            print(f"\n⏱️  TRADE DURATION")
+            print(f"   Avg: {trades_df['duration_minutes'].mean():.1f} minutes")
+            print(f"   Min: {trades_df['duration_minutes'].min():.1f} minutes")
+            print(f"   Max: {trades_df['duration_minutes'].max():.1f} minutes")
+
+            # Direction breakdown
+            print(f"\n🎯 DIRECTION BREAKDOWN")
+            for direction in ['LONG', 'SHORT']:
+                dir_trades = trades_df[trades_df['direction'] == direction]
+                if len(dir_trades) > 0:
+                    dir_pnl = dir_trades['pnl'].sum()
+                    dir_wins = len(dir_trades[dir_trades['pnl'] > 0])
+                    dir_wr = (dir_wins / len(dir_trades)) * 100
+                    print(f"   {direction}: {len(dir_trades)} trades | {dir_pnl:.2f} pts | {dir_wr:.1f}% WR")
+
+            # Save trades CSV
+            trades_csv = f"{BACKTEST_OUTPUT}/trades_{self.start_date}_to_{self.end_date}.csv"
+            trades_df.to_csv(trades_csv, index=False)
+            print(f"\n💾 Trade details saved to: {trades_csv}")
+
+        else:
+            print("\n⚠️  No trades executed (signals may not have met entry criteria)")
+
         # ✅ NEW: Order Book Analysis Report
         if self.analyze_orderbook and self.ob_analyzer:
             print("\n" + "="*60)
@@ -654,6 +748,155 @@ class TradingBotBacktester:
         print("\n" + "="*60)
         print("✅ BACKTEST COMPLETE!")
         print("="*60)
+
+    def _process_signal_as_trade(self, signal, current_price, timestamp):
+        """
+        Process a signal as a trade entry
+
+        Handles:
+        - Opening new position if no position open
+        - Flipping position if opposite signal
+        - Ignoring signal if same direction already open
+        """
+        signal_direction = signal['direction']  # 'LONG' or 'SHORT'
+
+        # If no position, open new trade
+        if self.open_position is None:
+            self.open_position = {
+                'direction': signal_direction,
+                'entry_price': current_price,
+                'entry_time': timestamp,
+                'entry_signal': signal,
+                'mae': 0.0,  # Maximum Adverse Excursion
+                'mfe': 0.0,  # Maximum Favorable Excursion
+                'running_pnl': 0.0
+            }
+            return
+
+        # If opposite signal, close current and open new
+        if signal_direction != self.open_position['direction']:
+            # Close existing position
+            self._close_trade(current_price, timestamp, reason="FLIP")
+
+            # Open new position in opposite direction
+            self.open_position = {
+                'direction': signal_direction,
+                'entry_price': current_price,
+                'entry_time': timestamp,
+                'entry_signal': signal,
+                'mae': 0.0,
+                'mfe': 0.0,
+                'running_pnl': 0.0
+            }
+
+        # If same direction signal, ignore (already in trade)
+
+    def _update_trade_metrics(self, bar_high, bar_low, bar_close, timestamp):
+        """
+        Update MAE/MFE for open position based on current bar
+
+        MAE: Maximum Adverse Excursion (worst drawdown)
+        MFE: Maximum Favorable Excursion (best profit)
+        """
+        if not self.open_position:
+            return
+
+        entry_price = self.open_position['entry_price']
+        direction = self.open_position['direction']
+
+        if direction == 'LONG':
+            # For long trades
+            # MFE is highest point above entry
+            # MAE is lowest point below entry
+            favorable_move = bar_high - entry_price
+            adverse_move = entry_price - bar_low
+
+            # Track running P&L
+            self.open_position['running_pnl'] = bar_close - entry_price
+
+            # Update MFE (max profit)
+            if favorable_move > self.open_position['mfe']:
+                self.open_position['mfe'] = favorable_move
+
+            # Update MAE (max loss)
+            if adverse_move > self.open_position['mae']:
+                self.open_position['mae'] = adverse_move
+
+            # Check stop/target
+            if adverse_move >= self.STOP_LOSS:
+                self._close_trade(entry_price - self.STOP_LOSS, timestamp, reason="STOP")
+            elif favorable_move >= self.TARGET_PROFIT:
+                self._close_trade(entry_price + self.TARGET_PROFIT, timestamp, reason="TARGET")
+
+        else:  # SHORT
+            # For short trades
+            # MFE is lowest point below entry
+            # MAE is highest point above entry
+            favorable_move = entry_price - bar_low
+            adverse_move = bar_high - entry_price
+
+            # Track running P&L
+            self.open_position['running_pnl'] = entry_price - bar_close
+
+            # Update MFE (max profit)
+            if favorable_move > self.open_position['mfe']:
+                self.open_position['mfe'] = favorable_move
+
+            # Update MAE (max loss)
+            if adverse_move > self.open_position['mae']:
+                self.open_position['mae'] = adverse_move
+
+            # Check stop/target
+            if adverse_move >= self.STOP_LOSS:
+                self._close_trade(entry_price + self.STOP_LOSS, timestamp, reason="STOP")
+            elif favorable_move >= self.TARGET_PROFIT:
+                self._close_trade(entry_price - self.TARGET_PROFIT, timestamp, reason="TARGET")
+
+    def _close_trade(self, exit_price, exit_time, reason="MANUAL"):
+        """
+        Close open position and record trade results
+
+        Args:
+            exit_price: Price at which trade exits
+            exit_time: Timestamp of exit
+            reason: Exit reason (STOP/TARGET/EOD/FLIP/MANUAL)
+        """
+        if not self.open_position:
+            return
+
+        # Calculate final P&L
+        entry_price = self.open_position['entry_price']
+        direction = self.open_position['direction']
+
+        if direction == 'LONG':
+            pnl = exit_price - entry_price
+        else:  # SHORT
+            pnl = entry_price - exit_price
+
+        # Calculate trade duration
+        duration = (exit_time - self.open_position['entry_time']).total_seconds() / 60  # minutes
+
+        # Record completed trade
+        trade_record = {
+            'entry_time': self.open_position['entry_time'],
+            'exit_time': exit_time,
+            'duration_minutes': duration,
+            'direction': direction,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'pnl': pnl,
+            'mae': self.open_position['mae'],  # Max loss during trade
+            'mfe': self.open_position['mfe'],  # Max profit during trade
+            'exit_reason': reason,
+            'entry_signal_type': self.open_position['entry_signal']['type'],
+            'entry_zone': self.open_position['entry_signal']['zone'],
+            'entry_level_price': self.open_position['entry_signal']['price']
+        }
+
+        self.trades.append(trade_record)
+
+        # Clear open position
+        self.open_position = None
 
 
 # ==============================================================================
