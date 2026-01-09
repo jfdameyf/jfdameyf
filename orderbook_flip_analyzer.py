@@ -1,227 +1,181 @@
 """
-Order Book FLIP Analyzer
-Analyzes Level 2/3 order book data around FLIP signals to measure liquidity quality
+OrderBook FLIP Analyzer
+Analyzes Level 2/3 order book data and Trade data around FLIP signals.
+Measures Resting Liquidity vs. True Absorption to validate signal quality.
 
 Required dependencies: pandas, numpy, databento, matplotlib, seaborn, pytz
 Install with: pip install pandas numpy databento matplotlib seaborn pytz
 """
 
-# Import standard library modules
-from datetime import datetime, timedelta
-from collections import defaultdict
 import logging
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import databento as db
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pytz
 
-# Try importing required dependencies with helpful error messages
-try:
-    import pandas as pd
-except ImportError as e:
-    raise ImportError(
-        "pandas is required for OrderBookFlipAnalyzer. "
-        "Install with: pip install pandas"
-    ) from e
-
-try:
-    import numpy as np
-except ImportError as e:
-    raise ImportError(
-        "numpy is required for OrderBookFlipAnalyzer. "
-        "Install with: pip install numpy"
-    ) from e
-
-try:
-    import databento as db
-except ImportError as e:
-    raise ImportError(
-        "databento is required for OrderBookFlipAnalyzer. "
-        "Install with: pip install databento"
-    ) from e
-
-try:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-except ImportError:
-    # Matplotlib/seaborn are only needed for plotting, allow import to succeed
-    plt = None
-    sns = None
-    logging.warning("matplotlib/seaborn not available - plotting will be disabled")
-
-try:
-    import pytz
-    NY_TZ = pytz.timezone('America/New_York')
-except ImportError:
-    # pytz is optional, can use UTC if not available
-    pytz = None
-    NY_TZ = None
-    logging.warning("pytz not available - using UTC for timestamps")
-
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class OrderBookFlipAnalyzer:
     """
-    Analyze order book dynamics around FLIP level events
-
-    A FLIP occurs when a failed support becomes resistance (or vice versa).
-    This class measures order book quality, liquidity absorption, and
-    microstructure changes to validate FLIP signal quality.
+    Analyze order book dynamics and order flow around FLIP level events.
     """
 
     def __init__(self, databento_client, symbol="ES.c.0", tick_proximity=5):
-        """
-        Initialize the order book analyzer
-
-        Args:
-            databento_client: Databento Historical client instance
-            symbol: Trading instrument (default: ES.c.0)
-            tick_proximity: How many ticks from level to include in analysis (default: 5)
-        """
         self.client = databento_client
         self.symbol = symbol
         self.tick_proximity = tick_proximity
-
-        # Storage for analysis results
         self.flip_analyses = []
-        self.pending_flips = {}  # Track levels that failed but haven't flipped yet
+        self.pending_flips = {}
 
-        # Instrument-specific settings
+        # Instrument settings
         self.tick_size = self._get_tick_size(symbol)
         self.large_order_threshold = self._get_large_order_threshold(symbol)
+        self.absorption_thresholds = self._get_absorption_thresholds(symbol)
 
         logging.info(f"OrderBookFlipAnalyzer initialized for {symbol}")
         logging.info(f"  Tick size: {self.tick_size}")
         logging.info(f"  Large order threshold: {self.large_order_threshold} contracts")
-        logging.info(f"  Proximity window: {tick_proximity} ticks")
+        logging.info(f"  Absorption thresholds: High={self.absorption_thresholds['high']}, Medium={self.absorption_thresholds['medium']}")
 
     def _get_tick_size(self, symbol):
-        """Get tick size for instrument"""
-        if symbol.startswith("ES"):
+        """Dynamically fetch tick size from Databento"""
+        try:
+            definition = self.client.definition.list_instruments(
+                dataset="GLBX.MDP3",
+                symbols=[symbol],
+                start=datetime.now(pytz.UTC) - timedelta(days=1)
+            )
+            tick_size = float(definition[0]['min_price_increment'])
+            logging.info(f"Fetched tick size for {symbol}: {tick_size}")
+            return tick_size
+        except Exception as e:
+            logging.warning(f"Could not fetch tick size for {symbol}, defaulting to 0.25. Error: {e}")
             return 0.25
-        elif symbol.startswith("NQ"):
-            return 0.25
-        elif symbol.startswith("GC"):
-            return 0.10
-        else:
-            return 0.25  # Default
 
     def _get_large_order_threshold(self, symbol):
         """Get threshold for what constitutes a 'large' order"""
         if symbol.startswith("ES"):
-            return 100  # 100+ contracts is large for ES
+            return 100
         elif symbol.startswith("NQ"):
             return 100
         elif symbol.startswith("GC"):
-            return 50   # Gold has smaller typical sizes
+            return 50
         else:
             return 100
 
+    def _get_absorption_thresholds(self, symbol):
+        """
+        Get instrument-specific thresholds for true absorption scoring.
+
+        Returns dict with 'high' and 'medium' thresholds in contracts.
+        """
+        if symbol.startswith("ES"):
+            return {'high': 500, 'medium': 200}
+        elif symbol.startswith("NQ"):
+            return {'high': 300, 'medium': 100}
+        elif symbol.startswith("GC"):
+            return {'high': 100, 'medium': 50}
+        else:
+            return {'high': 500, 'medium': 200}
+
     # ==========================================================================
-    # MAIN ANALYSIS METHODS
+    # MAIN ANALYSIS METHOD
     # ==========================================================================
 
     def analyze_flip_level(self, level_price, fail_time, flip_time,
                            original_type='RES', flip_type='SUP'):
         """
-        Analyze order book around a single FLIP event
-
-        This is the main entry point for analyzing a flip. It fetches order book
-        data before the failure and at the flip trigger, then compares them.
-
-        Args:
-            level_price: The price level that failed and flipped
-            fail_time: Timestamp when level reached FAILED state (blowout)
-            flip_time: Timestamp when flip signal triggered (recapture from opposite side)
-            original_type: Original level type ('SUP' or 'RES')
-            flip_type: New level type after flip ('RES' or 'SUP')
-
-        Returns:
-            Dictionary with comprehensive order book analysis
+        Analyze order book and trades around a single FLIP event.
         """
         logging.info(f"\n{'='*60}")
         logging.info(f"Analyzing FLIP: {level_price:.2f} ({original_type}→{flip_type})")
-        logging.info(f"  Failure: {fail_time}")
-        logging.info(f"  Flip:    {flip_time}")
+        logging.info(f"  Failure time: {fail_time}")
+        logging.info(f"  Flip time: {flip_time}")
         logging.info(f"{'='*60}")
 
         try:
-            # Fetch order book data around failure
+            # 1. Fetch Data (Book + Trades) for Failure Phase
+            logging.info("Fetching failure phase data...")
             fail_book = self._fetch_orderbook_snapshot(
                 start_time=fail_time - timedelta(minutes=10),
                 end_time=fail_time + timedelta(minutes=2),
                 focus_time=fail_time
             )
+            fail_trades = self._fetch_trades_snapshot(
+                start_time=fail_time - timedelta(minutes=10),
+                end_time=fail_time + timedelta(minutes=2)
+            )
+            logging.info(f"  Order book records: {len(fail_book)}, Trade records: {len(fail_trades)}")
 
-            # Fetch order book data around flip trigger
+            # 2. Fetch Data (Book + Trades) for Flip Phase
+            logging.info("Fetching flip phase data...")
             flip_book = self._fetch_orderbook_snapshot(
                 start_time=flip_time - timedelta(minutes=10),
                 end_time=flip_time + timedelta(minutes=2),
                 focus_time=flip_time
             )
+            flip_trades = self._fetch_trades_snapshot(
+                start_time=flip_time - timedelta(minutes=10),
+                end_time=flip_time + timedelta(minutes=2)
+            )
+            logging.info(f"  Order book records: {len(flip_book)}, Trade records: {len(flip_trades)}")
 
-            # Calculate metrics for failure phase
-            fail_metrics = self._analyze_orderbook_phase(
-                fail_book, level_price, original_type, phase='failure'
+            # 3. Calculate Metrics
+            logging.info("Calculating failure phase metrics...")
+            fail_metrics = self._analyze_phase(
+                fail_book, fail_trades, level_price, original_type, phase='failure'
             )
 
-            # Calculate metrics for flip phase
-            flip_metrics = self._analyze_orderbook_phase(
-                flip_book, level_price, flip_type, phase='flip'
+            logging.info("Calculating flip phase metrics...")
+            flip_metrics = self._analyze_phase(
+                flip_book, flip_trades, level_price, flip_type, phase='flip'
             )
 
-            # Compare the two phases
+            # 4. Compare & Score
+            logging.info("Comparing phases and scoring quality...")
             comparison = self._compare_phases(fail_metrics, flip_metrics)
+            quality_score = self._assess_flip_quality(fail_metrics, flip_metrics, comparison)
 
-            # Assess overall quality
-            quality_score = self._assess_flip_quality(
-                fail_metrics, flip_metrics, comparison
-            )
-
-            # Build comprehensive result
+            # 5. Build Result
             result = {
                 'level_price': level_price,
                 'original_type': original_type,
                 'flip_type': flip_type,
                 'fail_time': fail_time,
                 'flip_time': flip_time,
-                'time_between': (flip_time - fail_time).total_seconds() / 60,  # minutes
-
-                # Phase metrics
+                'time_between': (flip_time - fail_time).total_seconds() / 60,
                 'failure_phase': fail_metrics,
                 'flip_phase': flip_metrics,
-
-                # Comparison metrics
-                'liquidity_shift': comparison['liquidity_shift'],
-                'absorption_delta': comparison['absorption_delta'],
-                'imbalance_improvement': comparison['imbalance_improvement'],
-                'large_order_shift': comparison['large_order_shift'],
-
-                # Overall assessment
+                'comparison': comparison,
                 'quality_score': quality_score['score'],
                 'quality_rating': quality_score['rating'],
                 'confidence': quality_score['confidence'],
                 'recommendation': quality_score['recommendation']
             }
-
-            # Store result
             self.flip_analyses.append(result)
 
-            logging.info(f"✅ Analysis complete: {quality_score['rating']} quality")
-            logging.info(f"   Score: {quality_score['score']:.1f}/100")
-
+            logging.info(f"✅ Analysis complete: {quality_score['rating']} ({quality_score['score']:.1f}/100)")
+            logging.info(f"   Confidence: {quality_score['confidence']} | Recommendation: {quality_score['recommendation']}")
             return result
 
         except Exception as e:
             logging.error(f"❌ Error analyzing flip level: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+
+    # ==========================================================================
+    # PENDING FLIP TRACKING
+    # ==========================================================================
 
     def track_level_failure(self, level_price, fail_time, original_type):
         """
-        Track a level failure for future flip analysis
-
+        Track a level failure for future flip analysis.
         Call this when a level reaches FAILED state in the backtest.
-        Stores metadata for later analysis when/if the flip triggers.
-
-        Args:
-            level_price: Price level that failed
-            fail_time: Timestamp of failure
-            original_type: 'SUP' or 'RES'
         """
         key = f"{level_price:.2f}"
         self.pending_flips[key] = {
@@ -234,17 +188,8 @@ class OrderBookFlipAnalyzer:
 
     def process_flip_signal(self, signal, flip_time):
         """
-        Process a flip signal and run analysis if we tracked its failure
-
+        Process a flip signal and run analysis if we tracked its failure.
         Call this when a FLIP signal fires in the backtest.
-        If we previously tracked this level's failure, run full analysis.
-
-        Args:
-            signal: Signal dictionary from backtest
-            flip_time: Timestamp when flip signal fired
-
-        Returns:
-            Analysis result dict, or None if level wasn't tracked
         """
         level_price = signal.get('price')
         key = f"{level_price:.2f}"
@@ -270,253 +215,204 @@ class OrderBookFlipAnalyzer:
             return None
 
     # ==========================================================================
-    # ORDER BOOK DATA FETCHING
+    # DATA FETCHING
     # ==========================================================================
 
     def _fetch_orderbook_snapshot(self, start_time, end_time, focus_time):
-        """
-        Fetch Level 2 order book data for a time window
-
-        Args:
-            start_time: Start of window
-            end_time: End of window
-            focus_time: The key moment we're analyzing (failure or flip)
-
-        Returns:
-            DataFrame with order book data
-
-        TODO: Implement actual Databento MBP-10 fetching
-        Currently returns mock data structure
-        """
-        logging.debug(f"Fetching order book: {start_time} to {end_time}")
-
-        # TODO: Implement real Databento fetch
-        # Example implementation:
-        """
+        """Fetch Level 2 order book data (MBP-10 schema)"""
         try:
-            book_data = self.client.timeseries.get_range(
+            data = self.client.timeseries.get_range(
                 dataset="GLBX.MDP3",
-                schema="mbp-10",  # Market by price, 10 levels
+                schema="mbp-10",
                 symbols=[self.symbol],
                 stype_in="continuous",
                 start=start_time,
                 end=end_time
             ).to_df()
 
-            return book_data
+            # Check for expected columns
+            if not data.empty and 'bid_px_00' not in data.columns:
+                logging.warning("Expected MBP-10 columns not found in order book data")
+                logging.warning(f"Available columns: {list(data.columns)}")
+                return pd.DataFrame()
+
+            return data
         except Exception as e:
-            logging.error(f"Error fetching order book: {e}")
+            logging.warning(f"Orderbook fetch failed: {e}")
             return pd.DataFrame()
-        """
 
-        # For now, return empty DataFrame
-        # This allows the skeleton to be tested without actual data
-        return pd.DataFrame()
+    def _fetch_trades_snapshot(self, start_time, end_time):
+        """
+        Fetch Trade & Sales data to calculate aggressive volume and true absorption.
+        Returns DataFrame with 'price', 'size', 'side' columns.
+        """
+        try:
+            data = self.client.timeseries.get_range(
+                dataset="GLBX.MDP3",
+                schema="trades",
+                symbols=[self.symbol],
+                stype_in="continuous",
+                start=start_time,
+                end=end_time
+            ).to_df()
+
+            # Check for price conversion (Databento fixed-point format)
+            if not data.empty and 'price' in data.columns:
+                sample_price = data['price'].iloc[0]
+                if sample_price > 1000000:
+                    logging.warning(f"Trade prices appear to be in fixed-point format (sample: {sample_price})")
+                    logging.warning("Converting prices from fixed-point (dividing by 1e9)")
+                    data['price'] = data['price'] / 1e9
+
+            # Validate required columns
+            if not data.empty:
+                required_cols = ['price', 'size', 'side']
+                missing = [col for col in required_cols if col not in data.columns]
+                if missing:
+                    logging.warning(f"Trade data missing columns: {missing}")
+                    logging.warning(f"Available columns: {list(data.columns)}")
+
+            return data
+        except Exception as e:
+            logging.warning(f"Trade data fetch failed: {e}")
+            return pd.DataFrame()
 
     # ==========================================================================
-    # ORDER BOOK ANALYSIS METHODS
+    # CORE METRICS CALCULATIONS
     # ==========================================================================
 
-    def _analyze_orderbook_phase(self, book_data, level_price, level_type, phase='failure'):
-        """
-        Analyze order book for a specific phase (failure or flip)
+    def _analyze_phase(self, book_data, trade_data, level_price, level_type, phase):
+        """Calculate all metrics for a specific phase."""
+        if book_data.empty and trade_data.empty:
+            logging.warning(f"No data available for {phase} phase")
+            return self._empty_metrics(phase, level_type)
 
-        Args:
-            book_data: Order book DataFrame
-            level_price: Price level being analyzed
-            level_type: 'SUP' or 'RES'
-            phase: 'failure' or 'flip'
-
-        Returns:
-            Dictionary with phase metrics
-        """
-        if book_data.empty:
-            # Return empty metrics if no data
-            return self._empty_phase_metrics()
-
-        # Calculate key metrics
         metrics = {
             'phase': phase,
             'level_type': level_type,
 
-            # Liquidity metrics
-            'total_bid_size': self._calculate_total_bid_size(book_data, level_price),
-            'total_ask_size': self._calculate_total_ask_size(book_data, level_price),
-            'total_liquidity': 0,  # Will be sum of above
-
-            # Absorption at level
-            'absorption_at_level': self._calculate_absorption_at_level(
-                book_data, level_price, level_type
-            ),
-
-            # Order book imbalance
-            'bid_ask_ratio': 0,  # Will be calculated
+            # -- Resting Liquidity (Order Book) --
+            'resting_liquidity': self._calculate_resting_liquidity(book_data, level_price, level_type),
+            'total_bid_depth': self._calculate_total_bid_size(book_data, level_price),
+            'total_ask_depth': self._calculate_total_ask_size(book_data, level_price),
             'imbalance_score': self._calculate_imbalance(book_data, level_price),
+            'large_orders': self._count_large_orders(book_data, level_price),
 
-            # Large orders
-            'large_bids': self._count_large_orders(book_data, level_price, 'bid'),
-            'large_asks': self._count_large_orders(book_data, level_price, 'ask'),
-            'total_large_orders': 0,  # Will be sum
-
-            # Order book depth quality
-            'depth_quality': self._assess_depth_quality(book_data, level_price, level_type),
-
-            # Aggressive flow
-            'aggressive_buy_volume': self._calculate_aggressive_volume(book_data, 'buy'),
-            'aggressive_sell_volume': self._calculate_aggressive_volume(book_data, 'sell'),
-
-            # Book stability
-            'pulled_orders': self._detect_pulled_orders(book_data, level_price),
+            # -- Execution Flow (Trades) --
+            'true_absorption': self._calculate_true_absorption(trade_data, level_price),
+            'aggressive_buy_vol': self._calculate_aggressive_volume(trade_data, 'buy'),
+            'aggressive_sell_vol': self._calculate_aggressive_volume(trade_data, 'sell'),
         }
 
-        # Calculate derived metrics
-        metrics['total_liquidity'] = metrics['total_bid_size'] + metrics['total_ask_size']
-        metrics['total_large_orders'] = metrics['large_bids'] + metrics['large_asks']
+        # Assess depth quality based on Resting Liquidity
+        metrics['depth_quality'] = self._assess_depth_quality(metrics)
 
-        if metrics['total_ask_size'] > 0:
-            metrics['bid_ask_ratio'] = metrics['total_bid_size'] / metrics['total_ask_size']
-        else:
-            metrics['bid_ask_ratio'] = 99.0  # Infinite bid dominance
+        # Log phase summary
+        logging.info(f"  {phase.upper()} phase metrics:")
+        logging.info(f"    Resting liquidity: {metrics['resting_liquidity']} contracts")
+        logging.info(f"    True absorption: {metrics['true_absorption']} contracts")
+        logging.info(f"    Bid depth: {metrics['total_bid_depth']}, Ask depth: {metrics['total_ask_depth']}")
+        logging.info(f"    Aggressive buy: {metrics['aggressive_buy_vol']}, Aggressive sell: {metrics['aggressive_sell_vol']}")
+        logging.info(f"    Depth quality: {metrics['depth_quality']}")
 
         return metrics
 
-    def _empty_phase_metrics(self):
-        """Return empty metrics structure when no data available"""
-        return {
-            'phase': 'unknown',
-            'level_type': 'UNKNOWN',
-            'total_bid_size': 0,
-            'total_ask_size': 0,
-            'total_liquidity': 0,
-            'absorption_at_level': 0,
-            'bid_ask_ratio': 1.0,
-            'imbalance_score': 0,
-            'large_bids': 0,
-            'large_asks': 0,
-            'total_large_orders': 0,
-            'depth_quality': 'UNKNOWN',
-            'aggressive_buy_volume': 0,
-            'aggressive_sell_volume': 0,
-            'pulled_orders': 0,
-        }
-
-    def _calculate_total_bid_size(self, book_data, level_price):
+    def _calculate_resting_liquidity(self, book_data, level_price, level_type):
         """
-        Calculate total bid size within proximity of level
-
-        TODO: Implement with real order book data
-        """
-        # Placeholder
-        return 0
-
-    def _calculate_total_ask_size(self, book_data, level_price):
-        """
-        Calculate total ask size within proximity of level
-
-        TODO: Implement with real order book data
-        """
-        # Placeholder
-        return 0
-
-    def _calculate_absorption_at_level(self, book_data, level_price, level_type):
-        """
-        Calculate how much volume was absorbed exactly at the level
-
-        For SUP: Look at bid size at level_price
-        For RES: Look at ask size at level_price
-
-        TODO: Implement with real order book data
-        """
-        # Placeholder
-        return 0
-
-    def _calculate_imbalance(self, book_data, level_price):
-        """
-        Calculate order book imbalance near the level
-
-        Returns:
-            Float from -1.0 (ask dominated) to +1.0 (bid dominated)
-
-        TODO: Implement with real order book data
-        """
-        # Placeholder
-        return 0.0
-
-    def _count_large_orders(self, book_data, level_price, side):
-        """
-        Count large orders (>threshold) near the level
-
-        Args:
-            book_data: Order book data
-            level_price: Price level
-            side: 'bid' or 'ask'
-
-        Returns:
-            Integer count of large orders
-
-        TODO: Implement with real order book data
-        """
-        # Placeholder
-        return 0
-
-    def _assess_depth_quality(self, book_data, level_price, level_type):
-        """
-        Assess overall order book depth quality
-
-        Returns:
-            String: 'STRONG' | 'MODERATE' | 'WEAK' | 'VERY_WEAK'
-
-        Criteria:
-        - STRONG: Deep book, stacked orders, minimal imbalance
-        - MODERATE: Decent depth but some imbalance
-        - WEAK: Thin book or large imbalances
-        - VERY_WEAK: Extremely thin, high risk of false signals
-
-        TODO: Implement with real metrics
-        """
-        # Placeholder - return MODERATE for now
-        return 'MODERATE'
-
-    def _calculate_aggressive_volume(self, book_data, direction):
-        """
-        Calculate aggressive (market order) volume in direction
-
-        Aggressive volume indicates market orders that crossed the spread,
-        showing strong conviction to get filled immediately.
-
-        Args:
-            book_data: Trade data DataFrame (NOT order book, despite parameter name)
-                      Should contain 'side' and 'size' columns from Databento trades
-            direction: 'buy' or 'sell'
-
-        Returns:
-            Integer: Total aggressive volume in the specified direction
-
-        Note: This function is somewhat misnamed - it should accept trade data
-        rather than order book data. Trade data contains the aggressor side flag.
-
-        In Databento trade data:
-        - 'side' field: 'A' = trade at ask (buyer-initiated/aggressive buy)
-                       'B' = trade at bid (seller-initiated/aggressive sell)
-        - 'size' field: Contract quantity for the trade
+        Calculate volume SITTING at the level (Limit Orders).
+        This represents passive liquidity resting in the book.
         """
         if book_data.empty:
             return 0
 
-        # Check if we have required columns
-        if 'side' not in book_data.columns or 'size' not in book_data.columns:
+        snapshot = book_data.iloc[-1]
+        resting_vol = 0
+
+        # Use epsilon for float comparison (half a tick)
+        epsilon = self.tick_size / 2
+
+        if level_type == 'SUP':
+            # Look for bids at the support level
+            for i in range(10):
+                px = snapshot.get(f'bid_px_{i:02d}', 0)
+                sz = snapshot.get(f'bid_sz_{i:02d}', 0)
+                if abs(px - level_price) < epsilon:
+                    resting_vol += sz
+        else:  # RES
+            # Look for asks at the resistance level
+            for i in range(10):
+                px = snapshot.get(f'ask_px_{i:02d}', 0)
+                sz = snapshot.get(f'ask_sz_{i:02d}', 0)
+                if abs(px - level_price) < epsilon:
+                    resting_vol += sz
+
+        return int(resting_vol)
+
+    def _calculate_true_absorption(self, trade_data, level_price):
+        """
+        Calculate volume TRADED exactly at the level (Passive Fills).
+        This represents aggressive traders hitting the level but failing to move it.
+
+        Critical for FLIP analysis: High absorption = strong level defense.
+        """
+        if trade_data.empty:
+            return 0
+
+        # ✅ FIX: Use tick_size/2 as epsilon instead of 1e-4
+        epsilon = self.tick_size / 2
+
+        # Filter for trades occurring exactly at the level
+        at_level = trade_data[abs(trade_data['price'] - level_price) < epsilon]
+
+        total_absorbed = int(at_level['size'].sum())
+        num_trades = len(at_level)
+
+        logging.debug(f"  True absorption at {level_price:.2f}: {total_absorbed} contracts ({num_trades} trades)")
+
+        return total_absorbed
+
+    def _calculate_aggressive_volume(self, trade_data, direction):
+        """
+        Calculate aggressive (market order) volume by direction using Trade data.
+
+        Args:
+            trade_data: DataFrame with 'side' and 'size' columns
+            direction: 'buy' or 'sell'
+
+        Returns:
+            Integer: Total aggressive volume in the specified direction
+        """
+        if trade_data.empty:
+            return 0
+
+        # ✅ Defensive check for required columns
+        if 'side' not in trade_data.columns or 'size' not in trade_data.columns:
             logging.warning("Trade data missing 'side' or 'size' columns - cannot calculate aggressive volume")
             return 0
 
         try:
             if direction == 'buy':
-                # Aggressive buys: trades at ask (side == 'A')
-                aggressive_trades = book_data[book_data['side'] == 'A']
+                # Aggressive buys: trades at ask (side='A' in Databento)
+                aggressive_trades = trade_data[trade_data['side'] == 'A']
+
+                # Fallback for alternative encodings
+                if len(aggressive_trades) == 0:
+                    aggressive_trades = trade_data[
+                        (trade_data['side'] == 1) | (trade_data['side'] == 'Buy')
+                    ]
+
                 return int(aggressive_trades['size'].sum())
 
             elif direction == 'sell':
-                # Aggressive sells: trades at bid (side == 'B')
-                aggressive_trades = book_data[book_data['side'] == 'B']
+                # Aggressive sells: trades at bid (side='B' in Databento)
+                aggressive_trades = trade_data[trade_data['side'] == 'B']
+
+                # Fallback for alternative encodings
+                if len(aggressive_trades) == 0:
+                    aggressive_trades = trade_data[
+                        (trade_data['side'] == 2) | (trade_data['side'] == 'Sell')
+                    ]
+
                 return int(aggressive_trades['size'].sum())
 
             else:
@@ -527,148 +423,194 @@ class OrderBookFlipAnalyzer:
             logging.error(f"Error calculating aggressive volume: {e}")
             return 0
 
-    def _detect_pulled_orders(self, book_data, level_price):
-        """
-        Detect orders that were placed then pulled before execution
-
-        This is a bearish sign - indicates lack of conviction
-
-        TODO: Requires tracking order additions/cancellations
-        """
-        # Placeholder
-        return 0
-
     # ==========================================================================
-    # COMPARISON AND QUALITY ASSESSMENT
+    # HELPER CALCULATIONS
     # ==========================================================================
 
-    def _compare_phases(self, fail_metrics, flip_metrics):
+    def _calculate_total_bid_size(self, book_data, level_price):
+        """Calculate total bid size within tick_proximity of level"""
+        if book_data.empty:
+            return 0
+
+        snapshot = book_data.iloc[-1]
+        total = 0
+        limit = self.tick_size * self.tick_proximity
+
+        for i in range(10):
+            px = snapshot.get(f'bid_px_{i:02d}', 0)
+            if abs(px - level_price) <= limit:
+                total += snapshot.get(f'bid_sz_{i:02d}', 0)
+
+        return int(total)
+
+    def _calculate_total_ask_size(self, book_data, level_price):
+        """Calculate total ask size within tick_proximity of level"""
+        if book_data.empty:
+            return 0
+
+        snapshot = book_data.iloc[-1]
+        total = 0
+        limit = self.tick_size * self.tick_proximity
+
+        for i in range(10):
+            px = snapshot.get(f'ask_px_{i:02d}', 0)
+            if abs(px - level_price) <= limit:
+                total += snapshot.get(f'ask_sz_{i:02d}', 0)
+
+        return int(total)
+
+    def _calculate_imbalance(self, book_data, level_price):
         """
-        Compare failure phase vs flip phase to identify improvements
-
-        Args:
-            fail_metrics: Metrics from failure phase
-            flip_metrics: Metrics from flip phase
-
-        Returns:
-            Dictionary with comparison metrics
+        Calculate order book imbalance near the level.
+        Returns: Float from -1.0 (ask dominated) to +1.0 (bid dominated)
         """
-        comparison = {
-            # Liquidity changes
-            'liquidity_shift': flip_metrics['total_liquidity'] - fail_metrics['total_liquidity'],
-            'liquidity_shift_pct': 0,
+        bid = self._calculate_total_bid_size(book_data, level_price)
+        ask = self._calculate_total_ask_size(book_data, level_price)
+        total = bid + ask
 
-            # Absorption changes
-            'absorption_delta': flip_metrics['absorption_at_level'] - fail_metrics['absorption_at_level'],
-            'absorption_delta_pct': 0,
+        if total == 0:
+            return 0.0
 
-            # Imbalance improvement
-            'imbalance_improvement': self._calculate_imbalance_improvement(
-                fail_metrics, flip_metrics
-            ),
+        return (bid - ask) / total
 
-            # Large order changes
-            'large_order_shift': flip_metrics['total_large_orders'] - fail_metrics['total_large_orders'],
+    def _count_large_orders(self, book_data, level_price):
+        """Count large orders (>threshold) near the level"""
+        if book_data.empty:
+            return 0
 
-            # Depth quality change
-            'depth_improved': self._compare_depth_quality(
-                fail_metrics['depth_quality'],
-                flip_metrics['depth_quality']
-            ),
+        snapshot = book_data.iloc[-1]
+        count = 0
+        limit = self.tick_size * self.tick_proximity
+
+        # Check bids and asks
+        for side in ['bid', 'ask']:
+            for i in range(10):
+                px = snapshot.get(f'{side}_px_{i:02d}', 0)
+                sz = snapshot.get(f'{side}_sz_{i:02d}', 0)
+                if abs(px - level_price) <= limit and sz >= self.large_order_threshold:
+                    count += 1
+
+        return count
+
+    def _assess_depth_quality(self, metrics):
+        """
+        Assess order book depth quality based on liquidity and imbalance.
+        Returns: 'STRONG' | 'MODERATE' | 'WEAK' | 'VERY_WEAK'
+        """
+        liq = metrics['total_bid_depth'] + metrics['total_ask_depth']
+        resting = metrics['resting_liquidity']
+        imbalance = abs(metrics['imbalance_score'])
+
+        if liq > 2000 and resting > 500 and imbalance < 0.3:
+            return 'STRONG'
+        elif liq > 1000 and resting > 250:
+            return 'MODERATE'
+        elif liq > 500:
+            return 'WEAK'
+
+        return 'VERY_WEAK'
+
+    def _empty_metrics(self, phase, level_type):
+        """Return empty metrics structure when no data available"""
+        return {
+            'phase': phase,
+            'level_type': level_type,
+            'resting_liquidity': 0,
+            'total_bid_depth': 0,
+            'total_ask_depth': 0,
+            'imbalance_score': 0,
+            'large_orders': 0,
+            'true_absorption': 0,
+            'aggressive_buy_vol': 0,
+            'aggressive_sell_vol': 0,
+            'depth_quality': 'UNKNOWN'
         }
 
-        # Calculate percentages
-        if fail_metrics['total_liquidity'] > 0:
-            comparison['liquidity_shift_pct'] = (
-                comparison['liquidity_shift'] / fail_metrics['total_liquidity'] * 100
-            )
+    # ==========================================================================
+    # COMPARISON & SCORING
+    # ==========================================================================
 
-        if fail_metrics['absorption_at_level'] > 0:
-            comparison['absorption_delta_pct'] = (
-                comparison['absorption_delta'] / fail_metrics['absorption_at_level'] * 100
-            )
+    def _compare_phases(self, fail, flip):
+        """Compare failure phase vs flip phase to identify improvements"""
+        return {
+            'resting_liquidity_delta': flip['resting_liquidity'] - fail['resting_liquidity'],
+            'true_absorption_delta': flip['true_absorption'] - fail['true_absorption'],
+            'imbalance_improved': self._check_imbalance_improvement(fail, flip),
+            'depth_improved': flip['depth_quality'] == 'STRONG' and fail['depth_quality'] != 'STRONG',
+            'aggressive_flow_aligned': self._check_aggressive_flow_alignment(flip)
+        }
 
-        return comparison
+    def _check_imbalance_improvement(self, fail, flip):
+        """Check if imbalance improved in favor of new level type"""
+        # If flipping to SUP, we want positive imbalance (more bids)
+        if flip['level_type'] == 'SUP':
+            return flip['imbalance_score'] > fail['imbalance_score']
+        else:  # Flipping to RES, want negative imbalance (more asks)
+            return flip['imbalance_score'] < fail['imbalance_score']
 
-    def _calculate_imbalance_improvement(self, fail_metrics, flip_metrics):
-        """
-        Calculate whether imbalance improved in favor of new level type
-
-        For SUP flip: Want bid_ask_ratio to increase (more bids)
-        For RES flip: Want bid_ask_ratio to decrease (more asks)
-
-        Returns:
-            Float: Positive = improved, Negative = deteriorated
-        """
-        flip_type = flip_metrics['level_type']
-
-        if flip_type == 'SUP':
-            # Want higher bid/ask ratio
-            return flip_metrics['bid_ask_ratio'] - fail_metrics['bid_ask_ratio']
+    def _check_aggressive_flow_alignment(self, flip):
+        """Check if aggressive flow aligns with new level type"""
+        if flip['level_type'] == 'SUP':
+            # For SUP, want more aggressive buying
+            return flip['aggressive_buy_vol'] > flip['aggressive_sell_vol']
         else:  # RES
-            # Want lower bid/ask ratio (more asks)
-            return fail_metrics['bid_ask_ratio'] - flip_metrics['bid_ask_ratio']
+            # For RES, want more aggressive selling
+            return flip['aggressive_sell_vol'] > flip['aggressive_buy_vol']
 
-    def _compare_depth_quality(self, fail_quality, flip_quality):
+    def _assess_flip_quality(self, fail, flip, comp):
         """
-        Compare depth quality ratings
+        Assess overall FLIP signal quality based on all metrics.
 
-        Returns:
-            Boolean: True if quality improved
+        Scoring factors:
+        1. Resting Liquidity (Depth) - 25 points
+        2. True Absorption (Execution) - 30 points
+        3. Aggressive Flow Alignment - 20 points
+        4. Order Book Imbalance - 15 points
+        5. Depth Quality Improvement - 10 points
+
+        Returns: Dict with score, rating, confidence, recommendation
         """
-        quality_rank = {
-            'VERY_WEAK': 0,
-            'WEAK': 1,
-            'MODERATE': 2,
-            'STRONG': 3,
-            'UNKNOWN': 1  # Treat unknown as weak
-        }
+        score = 50  # Start at neutral
 
-        fail_rank = quality_rank.get(fail_quality, 1)
-        flip_rank = quality_rank.get(flip_quality, 1)
+        # ✅ Use instrument-specific thresholds
+        thresholds = self.absorption_thresholds
 
-        return flip_rank > fail_rank
-
-    def _assess_flip_quality(self, fail_metrics, flip_metrics, comparison):
-        """
-        Assess overall FLIP signal quality based on all metrics
-
-        Returns:
-            Dictionary with:
-            - score: 0-100 quality score
-            - rating: 'EXCELLENT' | 'GOOD' | 'FAIR' | 'POOR'
-            - confidence: 'HIGH' | 'MEDIUM' | 'LOW'
-            - recommendation: 'TAKE' | 'CONSIDER' | 'SKIP'
-        """
-        score = 50.0  # Start at neutral
-
-        # Factor 1: Liquidity improvement (+/- 20 points)
-        if comparison['liquidity_shift'] > 0:
-            score += min(20, comparison['liquidity_shift_pct'] / 5)
-        else:
-            score += max(-20, comparison['liquidity_shift_pct'] / 5)
-
-        # Factor 2: Absorption strength (+/- 15 points)
-        if flip_metrics['absorption_at_level'] > fail_metrics['absorption_at_level']:
+        # 1. Resting Liquidity (Depth) - Max 15 points
+        if comp['resting_liquidity_delta'] > 0:
+            score += 10
+        if flip['depth_quality'] == 'STRONG':
             score += 15
-        else:
-            score -= 10
+        elif flip['depth_quality'] == 'MODERATE':
+            score += 5
 
-        # Factor 3: Depth quality (+/- 15 points)
-        depth_scores = {'VERY_WEAK': -15, 'WEAK': -5, 'MODERATE': 5, 'STRONG': 15}
-        score += depth_scores.get(flip_metrics['depth_quality'], 0)
+        # 2. True Absorption (Execution) - Max 20 points
+        # High absorption at flip level = strong conviction
+        if flip['true_absorption'] > thresholds['high']:
+            score += 20
+            logging.debug(f"  ✅ High absorption bonus: +20 (>{thresholds['high']} contracts)")
+        elif flip['true_absorption'] > thresholds['medium']:
+            score += 10
+            logging.debug(f"  ✅ Medium absorption bonus: +10 (>{thresholds['medium']} contracts)")
 
-        # Factor 4: Large order support (+/- 10 points)
-        if comparison['large_order_shift'] > 0:
-            score += min(10, comparison['large_order_shift'] * 2)
-        else:
-            score -= 5
+        # 3. Aggressive Flow Alignment - Max 10 points
+        if comp['aggressive_flow_aligned']:
+            score += 10
+            logging.debug("  ✅ Aggressive flow aligned: +10")
 
-        # Factor 5: Imbalance improvement (+/- 10 points)
-        if comparison['imbalance_improvement'] > 0:
-            score += min(10, comparison['imbalance_improvement'] * 10)
-        else:
-            score -= 10
+        # 4. Order Book Imbalance - Max 10 points
+        if comp['imbalance_improved']:
+            score += 10
+            logging.debug("  ✅ Imbalance improved: +10")
+
+        # 5. Depth Quality Improvement - Max 10 points
+        if comp['depth_improved']:
+            score += 10
+            logging.debug("  ✅ Depth improved: +10")
+
+        # Bonus: Both high resting AND high absorption (synergy)
+        if flip['resting_liquidity'] > 300 and flip['true_absorption'] > thresholds['medium']:
+            score += 5
+            logging.debug("  ✅ Depth + Absorption synergy: +5")
 
         # Clamp score to 0-100
         score = max(0, min(100, score))
@@ -703,16 +645,11 @@ class OrderBookFlipAnalyzer:
         }
 
     # ==========================================================================
-    # REPORTING AND VISUALIZATION
+    # REPORTING
     # ==========================================================================
 
     def generate_summary_report(self):
-        """
-        Generate summary report of all analyzed FLIP events
-
-        Returns:
-            DataFrame with summary statistics
-        """
+        """Generate summary report of all analyzed FLIP events"""
         if not self.flip_analyses:
             print("❌ No FLIP analyses to report")
             return pd.DataFrame()
@@ -727,6 +664,7 @@ class OrderBookFlipAnalyzer:
         print(f"\n📈 OVERALL STATISTICS")
         print(f"   Total FLIPs Analyzed: {len(df)}")
         print(f"   Average Quality Score: {df['quality_score'].mean():.1f}/100")
+        print(f"   Average Time Between Fail→Flip: {df['time_between'].mean():.1f} minutes")
 
         # Rating distribution
         print(f"\n⭐ QUALITY DISTRIBUTION")
@@ -742,45 +680,50 @@ class OrderBookFlipAnalyzer:
             pct = (count / len(df) * 100) if len(df) > 0 else 0
             print(f"   {rec:10s}: {count:3d} ({pct:5.1f}%)")
 
-        # Liquidity insights
-        print(f"\n💰 LIQUIDITY INSIGHTS")
-        print(f"   Avg Liquidity Shift: {df['liquidity_shift'].mean():+,.0f} contracts")
-        print(f"   Avg Absorption Delta: {df['absorption_delta'].mean():+,.0f} contracts")
+        print("="*80 + "\n")
 
         return df
 
     def export_to_csv(self, filename='flip_orderbook_analysis.csv'):
-        """
-        Export analysis results to CSV
-
-        Args:
-            filename: Output CSV filename
-        """
+        """Export analysis results to CSV"""
         if not self.flip_analyses:
             logging.warning("No analyses to export")
             return
 
-        df = pd.DataFrame(self.flip_analyses)
+        # Flatten nested dicts for CSV export
+        flat_data = []
+        for analysis in self.flip_analyses:
+            flat_row = {
+                'level_price': analysis['level_price'],
+                'original_type': analysis['original_type'],
+                'flip_type': analysis['flip_type'],
+                'time_between_min': analysis['time_between'],
+                'quality_score': analysis['quality_score'],
+                'quality_rating': analysis['quality_rating'],
+                'confidence': analysis['confidence'],
+                'recommendation': analysis['recommendation'],
+            }
 
-        # Flatten nested dicts
-        # TODO: Expand nested failure_phase and flip_phase dicts
+            # Add failure phase metrics
+            for key, val in analysis['failure_phase'].items():
+                flat_row[f'fail_{key}'] = val
 
+            # Add flip phase metrics
+            for key, val in analysis['flip_phase'].items():
+                flat_row[f'flip_{key}'] = val
+
+            # Add comparison metrics
+            for key, val in analysis['comparison'].items():
+                flat_row[f'comp_{key}'] = val
+
+            flat_data.append(flat_row)
+
+        df = pd.DataFrame(flat_data)
         df.to_csv(filename, index=False)
         logging.info(f"✅ Exported {len(df)} analyses to {filename}")
 
     def plot_quality_distribution(self, save_path='flip_quality_distribution.png'):
-        """
-        Plot distribution of FLIP quality scores
-
-        Args:
-            save_path: Where to save the chart
-        """
-        if plt is None or sns is None:
-            logging.warning("matplotlib/seaborn not available - skipping plot generation")
-            print("⚠️  matplotlib/seaborn not installed - cannot generate quality chart")
-            print("   Install with: pip install matplotlib seaborn")
-            return
-
+        """Plot distribution of FLIP quality scores"""
         if not self.flip_analyses:
             logging.warning("No analyses to plot")
             return
@@ -841,19 +784,18 @@ def create_analyzer_from_api_key(api_key, symbol="ES.c.0"):
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Example: How to use the analyzer
-
     print("="*80)
-    print("OrderBook FLIP Analyzer - Skeleton Demo")
+    print("OrderBook FLIP Analyzer - Enhanced Version")
     print("="*80)
-
-    # NOTE: This is a skeleton. Real usage requires:
-    # 1. Valid Databento API key
-    # 2. Implementing _fetch_orderbook_snapshot() with actual MBP data
-    # 3. Implementing calculation methods with real order book data
-
+    print("\nFeatures:")
+    print("✅ Resting Liquidity (Order Book Depth)")
+    print("✅ True Absorption (Actual Volume Traded at Level)")
+    print("✅ Aggressive Flow Analysis (Buy vs Sell Pressure)")
+    print("✅ Instrument-Specific Thresholds")
+    print("✅ Comprehensive Quality Scoring")
     print("\nTo use this analyzer:")
     print("1. Set up Databento API key")
-    print("2. Implement order book data fetching")
-    print("3. Integrate with backtest framework")
-    print("\nSee orderbook_analysis_design.md for full implementation plan")
+    print("2. Create analyzer: analyzer = create_analyzer_from_api_key(api_key, 'ES.c.0')")
+    print("3. Track failures: analyzer.track_level_failure(price, time, 'SUP')")
+    print("4. Process flips: analyzer.process_flip_signal(signal, time)")
+    print("5. Generate report: analyzer.generate_summary_report()")
