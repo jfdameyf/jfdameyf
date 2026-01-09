@@ -66,6 +66,10 @@ class TradingBotBacktester:
         self.signals = []
         self.daily_stats = {}
 
+        # ✅ FIX 2: Session-wide signal deduplication
+        self.fired_signals_session = {}  # {signal_key: timestamp}
+        self.SIGNAL_COOLDOWN_MINUTES = 15  # Don't repeat same signal within 15 min
+
         # ✅ INTEGRATION POINT 1: Order Book Analysis Setup
         self.analyze_orderbook = analyze_orderbook
         self.ob_analyzer = None
@@ -260,10 +264,24 @@ class TradingBotBacktester:
                 signal = self._check_signal(strategy, current_price, level, timestamp)
 
                 if signal:
-                    signal_key = f"{signal['price']:.2f}_{signal['type']}"
-                    if signal_key not in fired_this_bar:
-                        signals.append(signal)
-                        fired_this_bar.add(signal_key)
+                    signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
+
+                    # Check per-bar deduplication
+                    if signal_key in fired_this_bar:
+                        continue
+
+                    # ✅ FIX 2: Check session-wide deduplication with cooldown
+                    if signal_key in self.fired_signals_session:
+                        last_fired = self.fired_signals_session[signal_key]
+                        time_since_minutes = (timestamp - last_fired).total_seconds() / 60
+
+                        if time_since_minutes < self.SIGNAL_COOLDOWN_MINUTES:
+                            continue  # Skip - too soon since last signal
+
+                    # Signal passed all checks
+                    signals.append(signal)
+                    fired_this_bar.add(signal_key)
+                    self.fired_signals_session[signal_key] = timestamp
 
         # Check resistance levels
         for level in plan.get('levels', {}).get('raw_res', []):
@@ -282,10 +300,24 @@ class TradingBotBacktester:
                 signal = self._check_signal(strategy, current_price, level, timestamp)
 
                 if signal:
-                    signal_key = f"{signal['price']:.2f}_{signal['type']}"
-                    if signal_key not in fired_this_bar:
-                        signals.append(signal)
-                        fired_this_bar.add(signal_key)
+                    signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
+
+                    # Check per-bar deduplication
+                    if signal_key in fired_this_bar:
+                        continue
+
+                    # ✅ FIX 2: Check session-wide deduplication with cooldown
+                    if signal_key in self.fired_signals_session:
+                        last_fired = self.fired_signals_session[signal_key]
+                        time_since_minutes = (timestamp - last_fired).total_seconds() / 60
+
+                        if time_since_minutes < self.SIGNAL_COOLDOWN_MINUTES:
+                            continue  # Skip - too soon since last signal
+
+                    # Signal passed all checks
+                    signals.append(signal)
+                    fired_this_bar.add(signal_key)
+                    self.fired_signals_session[signal_key] = timestamp
 
         # ✅ NEW: Also check FLIP monitors that were created from failed levels
         # These are levels that failed and now we're watching for opposite-side tests
@@ -319,10 +351,24 @@ class TradingBotBacktester:
             signal = self._check_signal(strategy, current_price, flip_level, timestamp)
 
             if signal:
-                signal_key = f"{signal['price']:.2f}_{signal['type']}"
-                if signal_key not in fired_this_bar:
-                    signals.append(signal)
-                    fired_this_bar.add(signal_key)
+                signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
+
+                # Check per-bar deduplication
+                if signal_key in fired_this_bar:
+                    continue
+
+                # ✅ FIX 2: Check session-wide deduplication with cooldown
+                if signal_key in self.fired_signals_session:
+                    last_fired = self.fired_signals_session[signal_key]
+                    time_since_minutes = (timestamp - last_fired).total_seconds() / 60
+
+                    if time_since_minutes < self.SIGNAL_COOLDOWN_MINUTES:
+                        continue  # Skip - too soon since last signal
+
+                # Signal passed all checks
+                signals.append(signal)
+                fired_this_bar.add(signal_key)
+                self.fired_signals_session[signal_key] = timestamp
 
         return signals
 

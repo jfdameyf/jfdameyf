@@ -217,10 +217,10 @@ class StrategyManager:
         # --- 2. ZONE LOGIC ---
 
         # ZONES 1 & 2: Responsive / Touch Trading
-        # ✅ FIX: Added proximity check
+        # ✅ FIX 3: Tightened proximity thresholds to reduce false signals
         if zone in [1, 2]:
-            # Must be within reasonable distance to trigger
-            proximity_threshold = 2.0 if zone == 1 else 4.0
+            # Must be within tight distance to trigger (1.0pts = 4 ticks, 1.5pts = 6 ticks)
+            proximity_threshold = 1.0 if zone == 1 else 1.5
 
             if distance <= proximity_threshold:
                 poc_info = f" {reason}" if reason else ""
@@ -597,7 +597,11 @@ class MarketPlanner:
 
     def get_smart_levels(self, current_price, predicted_range):
         if self.levels_df.empty: return {}
-        total_reach = predicted_range * (1 + BUFFER_PCT)
+
+        # ✅ FIX: Use minimum reach to ensure we fetch levels for all zones
+        MIN_REACH = 30.0  # Always look at least 30pts out
+        total_reach = max(predicted_range * (1 + BUFFER_PCT), MIN_REACH)
+
         candidates = self.levels_df.copy()
         candidates['dist'] = abs(candidates['price'] - current_price)
         active_df = candidates[candidates['dist'] <= total_reach].copy()
@@ -607,7 +611,10 @@ class MarketPlanner:
         def get_levels_hybrid(df, direction_label):
             if df.empty: return []
             try:
-                bins = np.linspace(0, total_reach, num=5)
+                # ✅ FIX: Use fixed distance bins instead of range-based
+                # This ensures all zones can be populated regardless of predicted range
+                # Zone 1: 0-5pts, Zone 2: 5-10pts, Zone 3: 10-20pts, Zone 4: 20+pts
+                bins = [0, 5, 10, 20, 1000]
                 labels = ['Zone 1', 'Zone 2', 'Zone 3', 'Zone 4']
                 df['zone'] = pd.cut(df['dist'], bins=bins, labels=labels, include_lowest=True)
                 selected_levels = []
