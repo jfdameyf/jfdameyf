@@ -21,7 +21,10 @@ import logging
 
 # ⚠️ ACTION REQUIRED: Replace with your actual key
 API_KEY = ""  # will place your databento API key here
-DISCORD_WEBHOOK_URL = ""  # will place your discord webhook url here
+
+# Discord Webhook URLs
+DISCORD_WEBHOOK_URL = ""  # For daily plan notifications (MarketPlanner)
+DISCORD_SIGNALS_WEBHOOK_URL = ""  # For trade signal alerts (LiveBot) - leave empty to use same as daily plan
 
 # --- STRATEGY SETTINGS ---
 # Set to False to disable the "Danger Zone" (>50pts) filter
@@ -997,7 +1000,10 @@ class LiveBot:
     def send_discord_alert(self, price, order_type, direction, size_mod, message, timestamp,
                            candle_delta=None, session_delta=None):
         """Send signal alert to Discord webhook with delta information"""
-        if not DISCORD_WEBHOOK_URL or "https" not in DISCORD_WEBHOOK_URL:
+        # Use dedicated signals webhook if configured, otherwise fall back to main webhook
+        webhook_url = DISCORD_SIGNALS_WEBHOOK_URL if DISCORD_SIGNALS_WEBHOOK_URL and "https" in DISCORD_SIGNALS_WEBHOOK_URL else DISCORD_WEBHOOK_URL
+
+        if not webhook_url or "https" not in webhook_url:
             return
 
         # Color based on direction
@@ -1039,7 +1045,7 @@ class LiveBot:
         }
 
         try:
-            requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+            requests.post(webhook_url, json={"embeds": [embed]})
         except:
             pass  # Silently fail if Discord webhook errors
 
