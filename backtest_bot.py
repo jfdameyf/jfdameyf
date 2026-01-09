@@ -70,6 +70,11 @@ class TradingBotBacktester:
         self.fired_signals_session = {}  # {signal_key: timestamp}
         self.SIGNAL_COOLDOWN_MINUTES = 15  # Don't repeat same signal within 15 min
 
+        # ✅ NEW: Dynamic SUP/RES tracking
+        self.previous_close = None  # Track previous bar's close to determine approach direction
+        self.level_last_signal = {}  # {level_price: {'direction': 'LONG/SHORT', 'timestamp': dt, 'price': float}}
+        self.WHIPSAW_PREVENTION_DISTANCE = 3.0  # Don't fire opposite signal within 3 points
+
         # ✅ INTEGRATION POINT 1: Order Book Analysis Setup
         self.analyze_orderbook = analyze_orderbook
         self.ob_analyzer = None
@@ -170,6 +175,10 @@ class TradingBotBacktester:
                 # Initialize strategy for this day
                 strategy = self._create_strategy_for_day(plan)
 
+                # ✅ NEW: Reset tracking variables for new day
+                self.previous_close = None  # Reset for new session
+                self.level_last_signal = {}  # Clear previous day's signals
+
                 # Track day stats
                 day_signals = []
                 tick_count = 0
@@ -235,7 +244,11 @@ class TradingBotBacktester:
         """
         Evaluate a single price bar for signals
 
-        ✅ UPDATED: Now includes level state tracking for FLIP detection
+        ✅ NEW APPROACH: Dynamic SUP/RES designation based on approach direction
+        - Levels are treated fluidly - type determined by price approach direction
+        - If approaching from below → level acts as RESISTANCE (sell)
+        - If approaching from above → level acts as SUPPORT (buy)
+        - Whipsaw prevention: don't fire opposite signals in close proximity
         """
         signals = []
         scan_range = 20.0  # Only check levels within 20 points
@@ -243,112 +256,90 @@ class TradingBotBacktester:
         # Track fired signals to prevent duplicates within same bar
         fired_this_bar = set()
 
-        # ✅ NEW: Track level states (required for FLIP detection)
-        # This monitors all levels and detects when they fail (creates FLIP monitors)
+        # ✅ NEW: Combine all levels (SUP + RES) into one array
+        # We'll dynamically assign type based on approach direction
+        all_levels = []
 
-        # Check support levels
+        # Get support levels
         for level in plan.get('levels', {}).get('raw_sup', []):
-            if abs(current_price - level['price']) <= scan_range:
-                level['type'] = 'SUP'
+            all_levels.append({
+                'price': level['price'],
+                'zone': level.get('zone', 0),
+                'original_type': 'SUP'  # Track original designation for reference
+            })
 
-                # Update level state (tracks WATCHING → VIOLATED → FAILED)
-                # This is what creates FLIP monitors when levels blow out
-                strategy.detect_level_recapture(
-                    current_price,
-                    level['price'],
-                    level['type'],
-                    timestamp  # ✅ NEW: Pass timestamp for time-based FLIP filtering
-                )
-
-                # Check for entry signals (RESPONSIVE, RECAPTURE, or FLIP)
-                signal = self._check_signal(strategy, current_price, level, timestamp)
-
-                if signal:
-                    signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
-
-                    # Check per-bar deduplication
-                    if signal_key in fired_this_bar:
-                        continue
-
-                    # ✅ FIX 2: Check session-wide deduplication with cooldown
-                    if signal_key in self.fired_signals_session:
-                        last_fired = self.fired_signals_session[signal_key]
-                        time_since_minutes = (timestamp - last_fired).total_seconds() / 60
-
-                        if time_since_minutes < self.SIGNAL_COOLDOWN_MINUTES:
-                            continue  # Skip - too soon since last signal
-
-                    # Signal passed all checks
-                    signals.append(signal)
-                    fired_this_bar.add(signal_key)
-                    self.fired_signals_session[signal_key] = timestamp
-
-        # Check resistance levels
+        # Get resistance levels
         for level in plan.get('levels', {}).get('raw_res', []):
-            if abs(current_price - level['price']) <= scan_range:
-                level['type'] = 'RES'
+            all_levels.append({
+                'price': level['price'],
+                'zone': level.get('zone', 0),
+                'original_type': 'RES'  # Track original designation for reference
+            })
 
-                # Update level state (tracks WATCHING → VIOLATED → FAILED)
-                strategy.detect_level_recapture(
-                    current_price,
-                    level['price'],
-                    level['type'],
-                    timestamp  # ✅ NEW: Pass timestamp for time-based FLIP filtering
-                )
+        # Check each level
+        for level in all_levels:
+            level_price = level['price']
 
-                # Check for entry signals (RESPONSIVE, RECAPTURE, or FLIP)
-                signal = self._check_signal(strategy, current_price, level, timestamp)
+            # Only check levels within scan range
+            if abs(current_price - level_price) > scan_range:
+                continue
 
-                if signal:
-                    signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
+            # ✅ DYNAMIC SUP/RES DESIGNATION
+            # Determine approach direction using previous bar's price
+            if self.previous_close is not None:
+                # Determine if we're approaching from above or below
+                prev_distance = abs(self.previous_close - level_price)
+                curr_distance = abs(current_price - level_price)
 
-                    # Check per-bar deduplication
-                    if signal_key in fired_this_bar:
+                # Are we getting closer to the level?
+                approaching = curr_distance < prev_distance
+
+                if approaching:
+                    # Price is approaching - determine from which direction
+                    if current_price < level_price:
+                        # Approaching from below → level acts as RESISTANCE (sell)
+                        level['type'] = 'RES'
+                        expected_direction = 'SHORT'
+                    else:
+                        # Approaching from above → level acts as SUPPORT (buy)
+                        level['type'] = 'SUP'
+                        expected_direction = 'LONG'
+                else:
+                    # Not approaching - use position relative to level
+                    if current_price < level_price:
+                        # Below level → it acts as RESISTANCE (sell when we touch it)
+                        level['type'] = 'RES'
+                        expected_direction = 'SHORT'
+                    else:
+                        # Above level → it acts as SUPPORT (buy when we touch it)
+                        level['type'] = 'SUP'
+                        expected_direction = 'LONG'
+            else:
+                # First bar - use simple position-based logic
+                if current_price < level_price:
+                    level['type'] = 'RES'
+                    expected_direction = 'SHORT'
+                else:
+                    level['type'] = 'SUP'
+                    expected_direction = 'LONG'
+
+            # ✅ WHIPSAW PREVENTION
+            # Don't fire opposite signal if we just fired the other direction at this level
+            level_key = f"{level_price:.2f}"
+            if level_key in self.level_last_signal:
+                last_sig = self.level_last_signal[level_key]
+                last_direction = last_sig['direction']
+                last_price = last_sig['price']
+
+                # Check if we're trying to fire opposite direction
+                if expected_direction != last_direction:
+                    # Check if we're still in whipsaw zone
+                    if abs(current_price - last_price) <= self.WHIPSAW_PREVENTION_DISTANCE:
+                        # Skip - too close to opposite signal
                         continue
 
-                    # ✅ FIX 2: Check session-wide deduplication with cooldown
-                    if signal_key in self.fired_signals_session:
-                        last_fired = self.fired_signals_session[signal_key]
-                        time_since_minutes = (timestamp - last_fired).total_seconds() / 60
-
-                        if time_since_minutes < self.SIGNAL_COOLDOWN_MINUTES:
-                            continue  # Skip - too soon since last signal
-
-                    # Signal passed all checks
-                    signals.append(signal)
-                    fired_this_bar.add(signal_key)
-                    self.fired_signals_session[signal_key] = timestamp
-
-        # ✅ NEW: Also check FLIP monitors that were created from failed levels
-        # These are levels that failed and now we're watching for opposite-side tests
-        flip_levels_to_check = []
-
-        for key, monitor in strategy.active_monitors.items():
-            if monitor.get('is_flip', False) and monitor['state'] in ['WATCHING', 'VIOLATED']:
-                # This is a FLIP monitor - extract price and type
-                parts = key.split('_')
-                if len(parts) == 2:
-                    flip_price = float(parts[0])
-                    flip_type = parts[1]
-
-                    if abs(current_price - flip_price) <= scan_range:
-                        flip_levels_to_check.append({
-                            'price': flip_price,
-                            'type': flip_type,
-                            'is_flip': True
-                        })
-
-        # Check FLIP levels for signals
-        for flip_level in flip_levels_to_check:
-            # ✅ NEW: Update FLIP monitor state with timestamp
-            strategy.detect_level_recapture(
-                current_price,
-                flip_level['price'],
-                flip_level['type'],
-                timestamp  # Pass timestamp for time-based FLIP filtering
-            )
-
-            signal = self._check_signal(strategy, current_price, flip_level, timestamp)
+            # Check for entry signal
+            signal = self._check_signal(strategy, current_price, level, timestamp)
 
             if signal:
                 signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
@@ -369,6 +360,16 @@ class TradingBotBacktester:
                 signals.append(signal)
                 fired_this_bar.add(signal_key)
                 self.fired_signals_session[signal_key] = timestamp
+
+                # Track this signal for whipsaw prevention
+                self.level_last_signal[level_key] = {
+                    'direction': signal['direction'],
+                    'timestamp': timestamp,
+                    'price': current_price
+                }
+
+        # Update previous close for next bar
+        self.previous_close = current_price
 
         return signals
 
