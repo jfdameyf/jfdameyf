@@ -481,14 +481,51 @@ class OrderBookFlipAnalyzer:
         """
         Calculate aggressive (market order) volume in direction
 
+        Aggressive volume indicates market orders that crossed the spread,
+        showing strong conviction to get filled immediately.
+
         Args:
-            book_data: Order book data
+            book_data: Trade data DataFrame (NOT order book, despite parameter name)
+                      Should contain 'side' and 'size' columns from Databento trades
             direction: 'buy' or 'sell'
 
-        TODO: Requires trade data with aggressor side flag
+        Returns:
+            Integer: Total aggressive volume in the specified direction
+
+        Note: This function is somewhat misnamed - it should accept trade data
+        rather than order book data. Trade data contains the aggressor side flag.
+
+        In Databento trade data:
+        - 'side' field: 'A' = trade at ask (buyer-initiated/aggressive buy)
+                       'B' = trade at bid (seller-initiated/aggressive sell)
+        - 'size' field: Contract quantity for the trade
         """
-        # Placeholder
-        return 0
+        if book_data.empty:
+            return 0
+
+        # Check if we have required columns
+        if 'side' not in book_data.columns or 'size' not in book_data.columns:
+            logging.warning("Trade data missing 'side' or 'size' columns - cannot calculate aggressive volume")
+            return 0
+
+        try:
+            if direction == 'buy':
+                # Aggressive buys: trades at ask (side == 'A')
+                aggressive_trades = book_data[book_data['side'] == 'A']
+                return int(aggressive_trades['size'].sum())
+
+            elif direction == 'sell':
+                # Aggressive sells: trades at bid (side == 'B')
+                aggressive_trades = book_data[book_data['side'] == 'B']
+                return int(aggressive_trades['size'].sum())
+
+            else:
+                logging.warning(f"Invalid direction: {direction}. Must be 'buy' or 'sell'")
+                return 0
+
+        except Exception as e:
+            logging.error(f"Error calculating aggressive volume: {e}")
+            return 0
 
     def _detect_pulled_orders(self, book_data, level_price):
         """

@@ -209,7 +209,7 @@ class StrategyManager:
             if not tradable:
                 return "NO_TRADE", 0.0, reason
         else:
-            reason = "POC Check Disabled"
+            reason = ""  # No POC filter - don't add confusing message
 
         # --- 2. ZONE LOGIC ---
 
@@ -220,7 +220,8 @@ class StrategyManager:
             proximity_threshold = 2.0 if zone == 1 else 4.0
 
             if distance <= proximity_threshold:
-                return "IMMEDIATE_ENTRY", modifier, f"Zone {zone}: Responsive Trade @ {distance:.1f}pts. {reason}"
+                poc_info = f" {reason}" if reason else ""
+                return "IMMEDIATE_ENTRY", modifier, f"Zone {zone}: Touch @ {level_price:.2f} ({distance:.2f}pts proximity){poc_info}"
             else:
                 return "WAIT", 0.0, f"Zone {zone}: Waiting for approach (dist: {distance:.1f})"
 
@@ -228,12 +229,14 @@ class StrategyManager:
         elif zone in [3, 4]:
             signal = self.detect_level_recapture(current_price, level_price, l_type)
 
+            poc_info = f" {reason}" if reason else ""
+
             if signal == "TRIGGER":
-                return "RECAPTURE_ENTRY", modifier, f"Zone {zone}: Recaptured! {reason}"
+                return "RECAPTURE_ENTRY", modifier, f"Zone {zone}: Recaptured @ {level_price:.2f}{poc_info}"
             elif signal == "FLIP_TRIGGER":
-                return "FLIP_ENTRY", modifier, f"Zone {zone}: FLIP Trade! (Old {'RES→SUP' if l_type == 'SUP' else 'SUP→RES'}) {reason}"
+                return "FLIP_ENTRY", modifier, f"Zone {zone}: FLIP @ {level_price:.2f} (Old {'RES→SUP' if l_type == 'SUP' else 'SUP→RES'}){poc_info}"
             elif signal == "WAITING_FOR_RECLAIM":
-                return "WAIT", 0.0, f"Zone {zone}: Monitoring... {reason}"
+                return "WAIT", 0.0, f"Zone {zone}: Monitoring..."
             else:
                 return "WAIT", 0.0, f"Zone {zone}: Too far / No setup."
 
@@ -720,6 +723,17 @@ class LiveBot:
         self.last_status_time = datetime.now()
         self.current_trading_day = datetime.now(NY_TZ).date()  # Track current day for reload
 
+        # ✅ NEW: Delta tracking for candles and session
+        self.current_candle = {
+            'start_time': None,
+            'buy_volume': 0,
+            'sell_volume': 0,
+            'delta': 0
+        }
+        self.session_cumulative_delta = 0
+        self.last_candle_minute = None
+        self.rth_start_time = None  # Regular trading hours start (9:30 AM ET)
+
         # ✅ FIX: Validate plan is for today's date
         if self.strategy.context:
             plan_date_str = self.strategy.context.get('timestamp', '')
@@ -760,7 +774,65 @@ class LiveBot:
 
         print(f"🔥 Unique Signals This Session: {len(self.active_signals)}")
         print(f"📊 Ticks Processed: {self.tick_count}")
+        print(f"📈 Session Cumulative Delta: {self.session_cumulative_delta:+,}")
+        print(f"📊 Current Candle Delta: {self.current_candle['delta']:+,}")
         print("="*60 + "\n")
+
+    def update_delta(self, record, current_time_dt):
+        """
+        Update delta tracking from trade data
+
+        Args:
+            record: Databento trade record
+            current_time_dt: Current datetime object in ET timezone
+        """
+        # Check if we have side information in the trade record
+        # Databento trades have 'side' field: 'A' = ask (buyer-initiated), 'B' = bid (seller-initiated)
+        if not hasattr(record, 'side') or not hasattr(record, 'size'):
+            return  # Can't calculate delta without side information
+
+        size = record.size if hasattr(record, 'size') else 0
+        side = record.side if hasattr(record, 'side') else None
+
+        # Determine if this is a buy or sell
+        # In Databento: 'A' = trade at ask (buyer aggressive), 'B' = trade at bid (seller aggressive)
+        if side == 'A':  # Buyer-initiated (bullish)
+            self.current_candle['buy_volume'] += size
+        elif side == 'B':  # Seller-initiated (bearish)
+            self.current_candle['sell_volume'] += size
+
+        # Update current candle delta
+        self.current_candle['delta'] = self.current_candle['buy_volume'] - self.current_candle['sell_volume']
+
+        # Check if we need to reset for new candle (every minute)
+        current_minute = current_time_dt.minute
+
+        if self.last_candle_minute is None:
+            self.last_candle_minute = current_minute
+            self.current_candle['start_time'] = current_time_dt
+        elif current_minute != self.last_candle_minute:
+            # New candle - add to session cumulative and reset
+            self.session_cumulative_delta += self.current_candle['delta']
+
+            # Reset for new candle
+            self.current_candle = {
+                'start_time': current_time_dt,
+                'buy_volume': 0,
+                'sell_volume': 0,
+                'delta': 0
+            }
+            self.last_candle_minute = current_minute
+
+        # Check if we're in RTH (9:30 AM - 4:00 PM ET) and reset session delta at start
+        current_hour = current_time_dt.hour
+        current_minute_total = current_hour * 60 + current_time_dt.minute
+        rth_start = 9 * 60 + 30  # 9:30 AM in minutes
+        rth_end = 16 * 60  # 4:00 PM in minutes
+
+        # Reset session cumulative delta at RTH start (9:30 AM)
+        if current_minute_total == rth_start and self.rth_start_time != current_time_dt.date():
+            self.session_cumulative_delta = 0
+            self.rth_start_time = current_time_dt.date()
 
     def evaluate_market(self, current_price):
         """
@@ -819,19 +891,26 @@ class LiveBot:
     def process_signal(self, price, level):
         action, mod, msg = self.strategy.check_entry_signal(price, level)
 
+        # Get current delta values for alert
+        candle_delta = self.current_candle['delta']
+        session_delta = self.session_cumulative_delta
+
         if action == "IMMEDIATE_ENTRY":
             direction = "LONG" if level['type'] == 'SUP' else "SHORT"
-            self.alert_signal(level['price'], "LIMIT / RESPONSIVE", direction, mod, msg)
+            self.alert_signal(level['price'], "LIMIT / RESPONSIVE", direction, mod, msg,
+                            candle_delta=candle_delta, session_delta=session_delta)
 
         elif action == "RECAPTURE_ENTRY":
             direction = "LONG" if level['type'] == 'SUP' else "SHORT"
-            self.alert_signal(price, "MARKET / RECAPTURE", direction, mod, msg)
+            self.alert_signal(price, "MARKET / RECAPTURE", direction, mod, msg,
+                            candle_delta=candle_delta, session_delta=session_delta)
 
         elif action == "FLIP_ENTRY":
             direction = "LONG" if level['type'] == 'SUP' else "SHORT"
-            self.alert_signal(price, "MARKET / FLIP", direction, mod, msg)
+            self.alert_signal(price, "MARKET / FLIP", direction, mod, msg,
+                            candle_delta=candle_delta, session_delta=session_delta)
 
-    def alert_signal(self, price, order_type, direction, size_mod, message):
+    def alert_signal(self, price, order_type, direction, size_mod, message, candle_delta=None, session_delta=None):
         """
         ✅ FIXED: Time-based deduplication instead of permanent blocking
         """
@@ -863,8 +942,9 @@ class LiveBot:
         # Log signal to CSV for backtesting
         self.log_signal_to_csv(current_time, direction, order_type, price, size_mod, message)
 
-        # Send Discord alert
-        self.send_discord_alert(price, order_type, direction, size_mod, message, current_time)
+        # Send Discord alert with delta information
+        self.send_discord_alert(price, order_type, direction, size_mod, message, current_time,
+                                candle_delta=candle_delta, session_delta=session_delta)
 
     def log_signal_to_csv(self, timestamp, direction, order_type, price, size_mod, message):
         """Log signal to CSV file for backtesting analysis"""
@@ -914,8 +994,9 @@ class LiveBot:
         except Exception as e:
             logging.warning(f"Failed to write signal to CSV: {e}")
 
-    def send_discord_alert(self, price, order_type, direction, size_mod, message, timestamp):
-        """Send signal alert to Discord webhook"""
+    def send_discord_alert(self, price, order_type, direction, size_mod, message, timestamp,
+                           candle_delta=None, session_delta=None):
+        """Send signal alert to Discord webhook with delta information"""
         if not DISCORD_WEBHOOK_URL or "https" not in DISCORD_WEBHOOK_URL:
             return
 
@@ -925,14 +1006,35 @@ class LiveBot:
         # Emoji for visual clarity
         direction_emoji = "🟢" if direction == "LONG" else "🔴"
 
+        # Build fields list
+        fields = [
+            {"name": "📊 Details", "value": message, "inline": False}
+        ]
+
+        # Add delta information if available
+        if candle_delta is not None:
+            delta_emoji = "🟢" if candle_delta > 0 else "🔴" if candle_delta < 0 else "⚪"
+            fields.append({
+                "name": f"{delta_emoji} Current Candle Delta",
+                "value": f"{candle_delta:+,} contracts",
+                "inline": True
+            })
+
+        if session_delta is not None:
+            session_emoji = "🟢" if session_delta > 0 else "🔴" if session_delta < 0 else "⚪"
+            fields.append({
+                "name": f"{session_emoji} Session Cumulative Delta (RTH)",
+                "value": f"{session_delta:+,} contracts",
+                "inline": True
+            })
+
+        fields.append({"name": "⏰ Time", "value": timestamp.strftime('%Y-%m-%d %H:%M:%S ET'), "inline": False})
+
         embed = {
             "title": f"🚀 {direction_emoji} ES {direction} SIGNAL",
             "description": f"**Entry Price:** {price:.2f}\n**Type:** {order_type}\n**Size:** {size_mod}x",
             "color": color,
-            "fields": [
-                {"name": "📊 Details", "value": message, "inline": False},
-                {"name": "⏰ Time", "value": timestamp.strftime('%Y-%m-%d %H:%M:%S ET'), "inline": False}
-            ],
+            "fields": fields,
             "footer": {"text": "ES Trading Bot • Live Signal"}
         }
 
@@ -993,9 +1095,13 @@ class LiveBot:
                 if hasattr(record, 'price') and record.price > 0:
                     # For GLBX.MDP3 trades, price is in fixed-point with 9 decimal precision
                     price = record.price / 1e9  # Convert from fixed-point
-                    current_time = datetime.now(NY_TZ).strftime('%H:%M:%S')
+                    current_time_dt = datetime.now(NY_TZ)
+                    current_time = current_time_dt.strftime('%H:%M:%S')
 
-                    # Calculate delta from last price
+                    # ✅ NEW: Update delta tracking (candle and session cumulative)
+                    self.update_delta(record, current_time_dt)
+
+                    # Calculate delta from last price (for display)
                     delta = 0.0
                     if self.last_price is not None:
                         delta = price - self.last_price
