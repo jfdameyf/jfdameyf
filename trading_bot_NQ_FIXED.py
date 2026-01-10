@@ -220,9 +220,10 @@ class StrategyManager:
                     return "NO_TRADE", 0.0, f"Delta too high for SHORT (Δ:{candle_delta:.0f} > {-delta_threshold:.0f})"
 
         # ZONES 1 & 2: Responsive (with proximity check)
-        # ✅ NQ SCALING: 6pts for Zone 1, 12pts for Zone 2 (vs ES 2/4)
+        # ✅ NQ SCALING: 8pts for Zone 1, 16pts for Zone 2 (4x ES: 2/4)
+        # Zone ranges: Z1=0-20pts, Z2=20-40pts, Z3=40-80pts, Z4=80+pts
         if zone in [1, 2]:
-            proximity_threshold = 6.0 if zone == 1 else 12.0
+            proximity_threshold = 8.0 if zone == 1 else 16.0
 
             if distance <= proximity_threshold:
                 return "IMMEDIATE_ENTRY", modifier, f"Zone {zone}: Responsive @ {distance:.1f}pts. {reason}"
@@ -530,7 +531,11 @@ class MarketPlanner:
         def get_levels_hybrid(df, direction_label):
             if df.empty: return []
             try:
-                bins = np.linspace(0, total_reach, num=5)
+                # ✅ FIX: Use fixed distance bins instead of range-based
+                # This ensures all zones can be populated regardless of predicted range
+                # Zone 1: 0-20pts, Zone 2: 20-40pts, Zone 3: 40-80pts, Zone 4: 80+pts
+                # (Scaled 4x from ES: 0-5, 5-10, 10-20, 20+)
+                bins = [0, 20, 40, 80, 10000]
                 labels = ['Zone 1', 'Zone 2', 'Zone 3', 'Zone 4']
                 df['zone'] = pd.cut(df['dist'], bins=bins, labels=labels, include_lowest=True)
                 selected_levels = []

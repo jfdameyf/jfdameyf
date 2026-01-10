@@ -654,6 +654,20 @@ class TradingBotBacktester:
         df_signals = pd.DataFrame(self.signals)
         df_trades = pd.DataFrame(self.trades)
 
+        # ✅ Initialize all variables with defaults (for JSON summary)
+        total_trades = 0
+        winning_trades = 0
+        losing_trades = 0
+        breakeven_trades = 0
+        win_rate = 0.0
+        total_pnl = 0.0
+        avg_pnl = 0.0
+        avg_winner = 0.0
+        avg_loser = 0.0
+        avg_mfe = 0.0
+        avg_mae = 0.0
+        avg_efficiency = 0.0
+
         # Overall stats
         print(f"\n📈 OVERALL STATISTICS")
         print(f"   Period: {self.start_date} to {self.end_date}")
@@ -702,6 +716,11 @@ class TradingBotBacktester:
             avg_winner = df_trades[df_trades['pnl'] > 0]['pnl'].mean() if winning_trades > 0 else 0
             avg_loser = df_trades[df_trades['pnl'] < 0]['pnl'].mean() if losing_trades > 0 else 0
 
+            # MAE/MFE Stats (set variables for JSON summary)
+            avg_mae = df_trades['mae'].mean()
+            avg_mfe = df_trades['mfe'].mean()
+            avg_efficiency = df_trades['efficiency'].mean() if 'efficiency' in df_trades.columns else 0
+
             print(f"\n💵 PROFIT & LOSS")
             print(f"   Total P&L: {total_pnl:.2f} pts (${total_pnl * 20:.2f})")
             print(f"   Avg P&L: {avg_pnl:.2f} pts")
@@ -713,8 +732,8 @@ class TradingBotBacktester:
 
             # MAE/MFE Stats
             print(f"\n📉 MAE/MFE ANALYSIS")
-            print(f"   Avg MAE (Max Adverse): {df_trades['mae'].mean():.2f} pts")
-            print(f"   Avg MFE (Max Favorable): {df_trades['mfe'].mean():.2f} pts")
+            print(f"   Avg MAE (Max Adverse): {avg_mae:.2f} pts")
+            print(f"   Avg MFE (Max Favorable): {avg_mfe:.2f} pts")
             print(f"   Max MAE: {df_trades['mae'].max():.2f} pts")
             print(f"   Max MFE: {df_trades['mfe'].max():.2f} pts")
 
@@ -775,8 +794,8 @@ class TradingBotBacktester:
             },
             'performance': {
                 'total_trades': len(df_trades),
-                'winners': int(wins) if not df_trades.empty else 0,
-                'losers': int(losses) if not df_trades.empty else 0,
+                'winners': int(winning_trades) if not df_trades.empty else 0,
+                'losers': int(losing_trades) if not df_trades.empty else 0,
                 'win_rate': float(win_rate) if not df_trades.empty else 0,
                 'total_pnl_points': float(total_pnl) if not df_trades.empty else 0,
                 'total_pnl_dollars': float(total_pnl * 20) if not df_trades.empty else 0,
