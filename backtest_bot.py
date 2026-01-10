@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 from trading_bot_FIXED import StrategyManager, MarketPlanner
 
 # Configuration
-API_KEY = # will place your databento API key here
+API_KEY = ""  # will place your databento API key here
 SYMBOL = "ES.c.0"
 NY_TZ = pytz.timezone('America/New_York')
 

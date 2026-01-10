@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore')
 from trading_bot_NQ_FIXED import StrategyManager, MarketPlanner
 
 # Configuration
-API_KEY = # will place your databento API key here
+API_KEY = ""  # will place your databento API key here
 SYMBOL = "NQ.c.0"
 NY_TZ = pytz.timezone('America/New_York')
 
