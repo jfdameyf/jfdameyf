@@ -322,7 +322,7 @@ class TradingBotBacktester:
         - Passes to check_signal for entry validation
         """
         signals = []
-        scan_range = 80.0  # NQ: 80pts (ES was 20pts)
+        scan_range = 120.0  # NQ: 120pts (covers all zones including Z4: 80+pts)
 
         # Track fired signals to prevent duplicates within same bar
         fired_this_bar = set()

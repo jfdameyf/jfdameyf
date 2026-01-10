@@ -370,7 +370,7 @@ class TradingBotBacktester:
         - Passes to check_signal for entry validation
         """
         signals = []
-        scan_range = 20.0  # Only check levels within 20 points
+        scan_range = 30.0  # Check levels within 30 points (covers all zones including Z4: 20+pts)
 
         # Track fired signals to prevent duplicates within same bar
         fired_this_bar = set()
