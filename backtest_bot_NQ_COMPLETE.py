@@ -37,7 +37,8 @@ os.makedirs(BACKTEST_OUTPUT, exist_ok=True)
 # ==============================================================================
 class TradingBotBacktester:
     def __init__(self, start_date, end_date, enable_poc_filter=False,
-                 signal_cooldown_minutes=60, target_points=12.0, stop_points=12.0):
+                 signal_cooldown_minutes=60, target_points=12.0, stop_points=12.0,
+                 use_delta_filter=False, delta_threshold=1600):
         """
         Initialize NQ backtester with trade outcome analysis
 
@@ -48,6 +49,9 @@ class TradingBotBacktester:
             signal_cooldown_minutes: int - Minimum time between signals (default: 60)
             target_points: float - Profit target in points (default: 12.0, adjusted from 10.0)
             stop_points: float - Stop loss in points (default: 12.0, adjusted from 6.0)
+            use_delta_filter: bool - Enable delta filtering (NEW, default: False for testing)
+            delta_threshold: int - Delta threshold for filtering (NEW, default: 1600)
+                                   Suggested range to test: 800, 1200, 1600, 2000, 2400
         """
         self.start_date = start_date
         self.end_date = end_date
@@ -55,6 +59,8 @@ class TradingBotBacktester:
         self.signal_cooldown = timedelta(minutes=signal_cooldown_minutes)
         self.target_points = target_points
         self.stop_points = stop_points
+        self.use_delta_filter = use_delta_filter
+        self.delta_threshold = delta_threshold
 
         if "YOUR_DATABENTO" in API_KEY:
             print("❌ ERROR: Please set your Databento API Key")
@@ -85,6 +91,7 @@ class TradingBotBacktester:
         print(f"🔬 NQ BACKTESTER INITIALIZED (COMPLETE VERSION)")
         print(f"   Period: {start_date} to {end_date}")
         print(f"   POC Filter: {enable_poc_filter}")
+        print(f"   Delta Filter: {use_delta_filter} (Threshold: {delta_threshold if use_delta_filter else 'N/A'})")
         print(f"   Signal Cooldown: {signal_cooldown_minutes} minutes")
         print(f"   Target: {target_points} pts | Stop: {stop_points} pts")
         print(f"   Point Value: $20/point (NQ)")
@@ -186,6 +193,8 @@ class TradingBotBacktester:
                     current_price = bar['close']
                     bar_high = bar['high']
                     bar_low = bar['low']
+                    bar_open = bar['open']
+                    bar_volume = bar.get('volume', 1000)  # Default if missing
 
                     # ✅ ADDITIONAL CHECK: Verify timestamp is within RTH
                     hour = timestamp.hour
@@ -194,13 +203,24 @@ class TradingBotBacktester:
                     if not (9 <= hour < 16 or (hour == 9 and minute >= 30)):
                         continue  # Skip non-RTH bars
 
+                    # ✅ NEW: Estimate candle delta from bar data (heuristic for NQ)
+                    price_change = current_price - bar_open
+                    price_range = bar_high - bar_low
+                    if price_range > 0:
+                        directional_strength = abs(price_change) / price_range
+                    else:
+                        directional_strength = 0.5
+
+                    estimated_delta = price_change * bar_volume * directional_strength * 0.01
+                    # Note: This is a rough estimate scaled for NQ
+
                     # ✅ NEW: Update open position MAE/MFE
                     if self.open_position:
                         self._update_trade_metrics(bar_high, bar_low, current_price, timestamp)
 
-                    # Check all levels for signals
+                    # Check all levels for signals (pass delta)
                     signals_this_bar = self._evaluate_bar(
-                        strategy, current_price, timestamp, plan
+                        strategy, current_price, timestamp, plan, candle_delta=estimated_delta
                     )
 
                     day_signals.extend(signals_this_bar)
@@ -253,9 +273,13 @@ class TradingBotBacktester:
         strategy.POC_SWEET_SPOT_MAX = 80.0
         strategy.POC_DANGER_THRESHOLD = 200.0
 
+        # ✅ NEW: Delta filter configuration for NQ
+        strategy.use_delta_filter = self.use_delta_filter
+        strategy.delta_threshold = self.delta_threshold
+
         return strategy
 
-    def _evaluate_bar(self, strategy, current_price, timestamp, plan):
+    def _evaluate_bar(self, strategy, current_price, timestamp, plan, candle_delta=None):
         """
         Evaluate a single price bar for signals
 
@@ -264,6 +288,10 @@ class TradingBotBacktester:
         - If approaching from below → level acts as RESISTANCE (sell)
         - If approaching from above → level acts as SUPPORT (buy)
         - Whipsaw prevention: don't fire opposite signals in close proximity
+
+        ✅ NEW: Delta filtering support for NQ
+        - Accepts estimated candle delta for filtering
+        - Passes to check_signal for entry validation
         """
         signals = []
         scan_range = 80.0  # NQ: 80pts (ES was 20pts)
@@ -353,8 +381,8 @@ class TradingBotBacktester:
                         # Skip - too close to opposite signal
                         continue
 
-            # Check for entry signal (with cooldown)
-            signal = self._check_signal_with_cooldown(strategy, current_price, level, timestamp)
+            # Check for entry signal (with cooldown, pass delta for filtering)
+            signal = self._check_signal_with_cooldown(strategy, current_price, level, timestamp, candle_delta=candle_delta)
 
             if signal:
                 signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
@@ -379,10 +407,11 @@ class TradingBotBacktester:
 
         return signals
 
-    def _check_signal_with_cooldown(self, strategy, current_price, level, timestamp):
+    def _check_signal_with_cooldown(self, strategy, current_price, level, timestamp, candle_delta=None):
         """
         Check signal with strict cooldown enforcement
         ✅ FIX: Improved key generation to prevent duplicates
+        ✅ NEW: Delta filtering support for NQ
         """
         # Create unique key: price_type_zone
         zone = strategy.get_zone_number(level)
@@ -394,8 +423,10 @@ class TradingBotBacktester:
             if time_since_last < self.signal_cooldown:
                 return None  # Still in cooldown
 
-        # Check if signal should fire
-        action, modifier, message = strategy.check_entry_signal(current_price, level)
+        # Check if signal should fire (pass delta for filtering)
+        action, modifier, message = strategy.check_entry_signal(current_price, level,
+                                                                 candle_delta=candle_delta,
+                                                                 session_delta=None)
 
         signal = None
 
@@ -1008,14 +1039,21 @@ class TradingBotBacktester:
 # QUICK BACKTEST RUNNER
 # ==============================================================================
 def quick_backtest(days_back=7, enable_poc=False, cooldown_minutes=60,
-                   target_points=12.0, stop_points=12.0):
-    """Quick NQ backtest with trade analysis (adjusted stop/target from 10.0/6.0)"""
+                   target_points=12.0, stop_points=12.0,
+                   use_delta_filter=False, delta_threshold=1600):
+    """
+    Quick NQ backtest with trade analysis
+
+    Args:
+        use_delta_filter: Enable delta filtering (default: False for baseline testing)
+        delta_threshold: Delta threshold to test (suggested: 800, 1200, 1600, 2000, 2400)
+    """
     end_date = datetime.now(NY_TZ).date() - timedelta(days=1)
     start_date = end_date - timedelta(days=days_back + 5)
 
     backtester = TradingBotBacktester(
         start_date, end_date, enable_poc, cooldown_minutes,
-        target_points, stop_points
+        target_points, stop_points, use_delta_filter, delta_threshold
     )
     backtester.run_full_backtest()
 

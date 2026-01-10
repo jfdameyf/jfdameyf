@@ -303,6 +303,7 @@ class StrategyManager:
             reason = ""  # No POC filter - don't add confusing message
 
         # --- 2. DELTA FILTER (NEW) ---
+        # ✅ UPDATED: Apply to ALL zones (not just 1 & 2) for comprehensive backtesting
         if self.use_delta_filter and candle_delta is not None:
             # Determine threshold based on mode
             if self.delta_mode == "static":
@@ -312,14 +313,13 @@ class StrategyManager:
             else:
                 delta_threshold = self.static_delta_threshold  # Fallback
 
-            # Apply delta filter for Zone 1 & 2 (responsive trades)
-            if zone in [1, 2]:
-                if l_type == 'SUP':  # LONG
-                    if candle_delta < delta_threshold:
-                        return "NO_TRADE", 0.0, f"Delta too low for LONG ({candle_delta:.0f} < {delta_threshold:.0f})"
-                elif l_type == 'RES':  # SHORT
-                    if candle_delta > -delta_threshold:
-                        return "NO_TRADE", 0.0, f"Delta too high for SHORT ({candle_delta:.0f} > {-delta_threshold:.0f})"
+            # Apply delta filter to all zones for backtesting
+            if l_type == 'SUP':  # LONG
+                if candle_delta < delta_threshold:
+                    return "NO_TRADE", 0.0, f"Delta too low for LONG (Δ:{candle_delta:.0f} < {delta_threshold:.0f})"
+            elif l_type == 'RES':  # SHORT
+                if candle_delta > -delta_threshold:
+                    return "NO_TRADE", 0.0, f"Delta too high for SHORT (Δ:{candle_delta:.0f} > {-delta_threshold:.0f})"
 
         # --- 3. ZONE LOGIC ---
 

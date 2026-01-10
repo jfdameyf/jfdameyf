@@ -181,9 +181,10 @@ class StrategyManager:
         if "Zone 4" in zone_str: return 4
         return 1
 
-    def check_entry_signal(self, current_price, level_info):
+    def check_entry_signal(self, current_price, level_info, candle_delta=None, session_delta=None):
         """
         ✅ IMPROVED: Added proximity checks (scaled for NQ)
+        ✅ NEW: Delta filtering support for NQ
         """
         zone = self.get_zone_number(level_info)
         level_price = level_info['price']
@@ -205,6 +206,18 @@ class StrategyManager:
                 return "NO_TRADE", 0.0, reason
         else:
             reason = "POC Check Disabled"
+
+        # ✅ NEW: DELTA FILTER (for backtesting different thresholds)
+        # Apply to all zones to test comprehensively
+        if hasattr(self, 'use_delta_filter') and self.use_delta_filter and candle_delta is not None:
+            delta_threshold = getattr(self, 'delta_threshold', 1600)  # Default NQ threshold
+
+            if l_type == 'SUP':  # LONG
+                if candle_delta < delta_threshold:
+                    return "NO_TRADE", 0.0, f"Delta too low for LONG (Δ:{candle_delta:.0f} < {delta_threshold:.0f})"
+            elif l_type == 'RES':  # SHORT
+                if candle_delta > -delta_threshold:
+                    return "NO_TRADE", 0.0, f"Delta too high for SHORT (Δ:{candle_delta:.0f} > {-delta_threshold:.0f})"
 
         # ZONES 1 & 2: Responsive (with proximity check)
         # ✅ NQ SCALING: 6pts for Zone 1, 12pts for Zone 2 (vs ES 2/4)
