@@ -174,7 +174,7 @@ class TradingBotBacktester:
             end_dt = NY_TZ.localize(datetime.combine(test_date, time(16, 0)))
 
             try:
-                # Fetch minute bars (more efficient than ticks for backtest)
+                # ✅ Step 1: Fetch minute bars for price/MAE/MFE tracking
                 bars = self.client.timeseries.get_range(
                     dataset="GLBX.MDP3",
                     schema="ohlcv-1m",
@@ -187,6 +187,41 @@ class TradingBotBacktester:
                 if bars.empty:
                     print(f"   ⚠️ No data (holiday/weekend)")
                     continue
+
+                # ✅ Step 2: Fetch trade data for REAL delta calculation
+                print(f"   📊 Fetching trade data for delta calculation...")
+                try:
+                    trades = self.client.timeseries.get_range(
+                        dataset="GLBX.MDP3",
+                        schema="trades",
+                        symbols=[SYMBOL],
+                        stype_in="continuous",
+                        start=start_dt,
+                        end=end_dt
+                    ).to_df()
+
+                    # ✅ Step 3: Calculate real delta per 1-minute candle
+                    delta_by_minute = {}
+                    if not trades.empty:
+                        # Convert side to numeric: 'A' (Aggressor=Buy) = +1, 'B' (Aggressor=Sell) = -1
+                        trades['delta'] = trades.apply(
+                            lambda row: row['size'] if row['side'] == 'A' else -row['size'],
+                            axis=1
+                        )
+
+                        # Group by minute and sum delta
+                        trades.index = trades.index.floor('1min')  # Round to minute
+                        delta_df = trades.groupby(trades.index)['delta'].sum()
+                        delta_by_minute = delta_df.to_dict()
+
+                        print(f"   ✅ Calculated real delta for {len(delta_by_minute)} minute bars")
+                    else:
+                        print(f"   ⚠️ No trade data available, delta filter will be disabled for this day")
+
+                except Exception as e:
+                    print(f"   ⚠️ Error fetching trade data: {e}")
+                    print(f"   Delta filter will be disabled for this day")
+                    delta_by_minute = {}
 
                 # Initialize strategy for this day
                 strategy = self._create_strategy_for_day(plan)
@@ -208,28 +243,17 @@ class TradingBotBacktester:
                     bar_open = bar['open']
                     bar_volume = bar.get('volume', 1000)  # Default if missing
 
-                    # ✅ NEW: Estimate candle delta from bar data (heuristic)
-                    # Real delta requires trade-by-trade data, so we estimate:
-                    # - Positive if close > open (buying pressure)
-                    # - Negative if close < open (selling pressure)
-                    # - Magnitude based on volume and price move percentage
-                    price_change = current_price - bar_open
-                    price_range = bar_high - bar_low
-                    if price_range > 0:
-                        directional_strength = abs(price_change) / price_range
-                    else:
-                        directional_strength = 0.5
-
-                    estimated_delta = price_change * bar_volume * directional_strength * 0.01
-                    # Note: This is a rough estimate. Real delta would be calculated from trades.
+                    # ✅ NEW: Look up REAL candle delta from trade data
+                    # Use the pre-calculated delta_by_minute dictionary
+                    real_delta = delta_by_minute.get(timestamp, None)
 
                     # ✅ NEW: Update open position MAE/MFE
                     if self.open_position:
                         self._update_trade_metrics(bar_high, bar_low, current_price, timestamp)
 
-                    # Check all levels (pass estimated delta)
+                    # Check all levels (pass real delta from trade data)
                     signals_this_bar = self._evaluate_bar(
-                        strategy, current_price, timestamp, plan, candle_delta=estimated_delta
+                        strategy, current_price, timestamp, plan, candle_delta=real_delta
                     )
 
                     day_signals.extend(signals_this_bar)

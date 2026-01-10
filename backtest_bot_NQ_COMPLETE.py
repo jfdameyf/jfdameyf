@@ -180,6 +180,41 @@ class TradingBotBacktester:
                     print(f"   ⚠️ No RTH data")
                     continue
 
+                # ✅ Step 2: Fetch trade data for REAL delta calculation
+                print(f"   📊 Fetching trade data for delta calculation...")
+                try:
+                    trades = self.client.timeseries.get_range(
+                        dataset="GLBX.MDP3",
+                        schema="trades",
+                        symbols=[SYMBOL],
+                        stype_in="continuous",
+                        start=start_dt,
+                        end=end_dt
+                    ).to_df()
+
+                    # ✅ Step 3: Calculate real delta per 1-minute candle
+                    delta_by_minute = {}
+                    if not trades.empty:
+                        # Convert side to numeric: 'A' (Aggressor=Buy) = +size, 'B' (Aggressor=Sell) = -size
+                        trades['delta'] = trades.apply(
+                            lambda row: row['size'] if row['side'] == 'A' else -row['size'],
+                            axis=1
+                        )
+
+                        # Group by minute and sum delta
+                        trades.index = trades.index.floor('1min')  # Round to minute
+                        delta_df = trades.groupby(trades.index)['delta'].sum()
+                        delta_by_minute = delta_df.to_dict()
+
+                        print(f"   ✅ Calculated real delta for {len(delta_by_minute)} minute bars")
+                    else:
+                        print(f"   ⚠️ No trade data available, delta filter will be disabled for this day")
+
+                except Exception as e:
+                    print(f"   ⚠️ Error fetching trade data: {e}")
+                    print(f"   Delta filter will be disabled for this day")
+                    delta_by_minute = {}
+
                 # Initialize strategy for this day
                 strategy = self._create_strategy_for_day(plan)
 
@@ -203,24 +238,17 @@ class TradingBotBacktester:
                     if not (9 <= hour < 16 or (hour == 9 and minute >= 30)):
                         continue  # Skip non-RTH bars
 
-                    # ✅ NEW: Estimate candle delta from bar data (heuristic for NQ)
-                    price_change = current_price - bar_open
-                    price_range = bar_high - bar_low
-                    if price_range > 0:
-                        directional_strength = abs(price_change) / price_range
-                    else:
-                        directional_strength = 0.5
-
-                    estimated_delta = price_change * bar_volume * directional_strength * 0.01
-                    # Note: This is a rough estimate scaled for NQ
+                    # ✅ NEW: Look up REAL candle delta from trade data
+                    # Use the pre-calculated delta_by_minute dictionary
+                    real_delta = delta_by_minute.get(timestamp, None)
 
                     # ✅ NEW: Update open position MAE/MFE
                     if self.open_position:
                         self._update_trade_metrics(bar_high, bar_low, current_price, timestamp)
 
-                    # Check all levels for signals (pass delta)
+                    # Check all levels for signals (pass real delta from trade data)
                     signals_this_bar = self._evaluate_bar(
-                        strategy, current_price, timestamp, plan, candle_delta=estimated_delta
+                        strategy, current_price, timestamp, plan, candle_delta=real_delta
                     )
 
                     day_signals.extend(signals_this_bar)
