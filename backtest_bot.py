@@ -39,7 +39,8 @@ os.makedirs(BACKTEST_OUTPUT, exist_ok=True)
 # ==============================================================================
 class TradingBotBacktester:
     def __init__(self, start_date, end_date, enable_poc_filter=False,
-                 analyze_orderbook=False, databento_api_key=None):
+                 analyze_orderbook=False, databento_api_key=None,
+                 use_delta_filter=True, delta_mode="static", static_delta_threshold=400):
         """
         Initialize backtester
 
@@ -49,10 +50,16 @@ class TradingBotBacktester:
             enable_poc_filter: bool - Enable POC distance filtering
             analyze_orderbook: bool - Enable order book FLIP analysis (NEW)
             databento_api_key: str - Databento API key for order book data (NEW)
+            use_delta_filter: bool - Enable delta filtering (NEW)
+            delta_mode: str - "static" or "dynamic" (NEW)
+            static_delta_threshold: int - Fixed delta threshold (NEW, default: 400)
         """
         self.start_date = start_date
         self.end_date = end_date
         self.enable_poc_filter = enable_poc_filter
+        self.use_delta_filter = use_delta_filter
+        self.delta_mode = delta_mode
+        self.static_delta_threshold = static_delta_threshold
 
         if "YOUR_DATABENTO" in API_KEY:
             print("❌ ERROR: Please set your Databento API Key")
@@ -106,6 +113,9 @@ class TradingBotBacktester:
         print(f"🔬 BACKTESTER INITIALIZED")
         print(f"   Period: {start_date} to {end_date}")
         print(f"   POC Filter: {enable_poc_filter}")
+        print(f"   Delta Filter: {use_delta_filter} ({delta_mode.upper()} mode)")
+        if use_delta_filter and delta_mode == "static":
+            print(f"   Delta Threshold: {static_delta_threshold}")
         print(f"   Order Book Analysis: {self.analyze_orderbook}")
         print(f"   Symbol: {SYMBOL}\n")
 
@@ -195,14 +205,31 @@ class TradingBotBacktester:
                     current_price = bar['close']
                     bar_high = bar['high']
                     bar_low = bar['low']
+                    bar_open = bar['open']
+                    bar_volume = bar.get('volume', 1000)  # Default if missing
+
+                    # ✅ NEW: Estimate candle delta from bar data (heuristic)
+                    # Real delta requires trade-by-trade data, so we estimate:
+                    # - Positive if close > open (buying pressure)
+                    # - Negative if close < open (selling pressure)
+                    # - Magnitude based on volume and price move percentage
+                    price_change = current_price - bar_open
+                    price_range = bar_high - bar_low
+                    if price_range > 0:
+                        directional_strength = abs(price_change) / price_range
+                    else:
+                        directional_strength = 0.5
+
+                    estimated_delta = price_change * bar_volume * directional_strength * 0.01
+                    # Note: This is a rough estimate. Real delta would be calculated from trades.
 
                     # ✅ NEW: Update open position MAE/MFE
                     if self.open_position:
                         self._update_trade_metrics(bar_high, bar_low, current_price, timestamp)
 
-                    # Check all levels
+                    # Check all levels (pass estimated delta)
                     signals_this_bar = self._evaluate_bar(
-                        strategy, current_price, timestamp, plan
+                        strategy, current_price, timestamp, plan, candle_delta=estimated_delta
                     )
 
                     day_signals.extend(signals_this_bar)
@@ -258,9 +285,53 @@ class TradingBotBacktester:
         strategy.POC_SWEET_SPOT_MAX = 20.0
         strategy.POC_DANGER_THRESHOLD = 50.0
 
+        # ✅ NEW: Delta filter configuration
+        strategy.use_delta_filter = self.use_delta_filter
+        strategy.delta_mode = self.delta_mode
+        strategy.static_delta_threshold = self.static_delta_threshold
+        strategy.dynamic_delta_threshold = None
+        strategy.dynamic_volume_threshold = None
+
+        # Calculate dynamic thresholds if needed (using previous day's data)
+        if self.use_delta_filter and self.delta_mode == "dynamic":
+            # For backtest, calculate from data BEFORE the test day
+            # This ensures we're not looking into the future
+            strategy.dynamic_delta_threshold = self._calculate_dynamic_threshold_for_day(plan)
+
         return strategy
 
-    def _evaluate_bar(self, strategy, current_price, timestamp, plan):
+    def _calculate_dynamic_threshold_for_day(self, plan):
+        """
+        Calculate dynamic delta threshold from previous day's data
+
+        ✅ Simplified version using heuristic based on market range
+        In production, this would fetch actual trade data from previous day
+
+        Args:
+            plan: Current day's plan (contains market context)
+
+        Returns:
+            float: Calculated delta threshold or static fallback
+        """
+        try:
+            # Get predicted range from plan
+            predicted_range = plan.get('predicted_range', 40.0)
+
+            # Heuristic: Higher volatility days need higher delta threshold
+            # Base: 400 for avg 40pt range
+            # Scale linearly with range
+            dynamic_threshold = 400.0 * (predicted_range / 40.0)
+
+            # Clamp to reasonable bounds (200-800)
+            dynamic_threshold = max(200, min(800, dynamic_threshold))
+
+            return dynamic_threshold
+
+        except Exception as e:
+            logging.error(f"Error calculating dynamic threshold: {e}")
+            return self.static_delta_threshold  # Fallback
+
+    def _evaluate_bar(self, strategy, current_price, timestamp, plan, candle_delta=None):
         """
         Evaluate a single price bar for signals
 
@@ -269,6 +340,10 @@ class TradingBotBacktester:
         - If approaching from below → level acts as RESISTANCE (sell)
         - If approaching from above → level acts as SUPPORT (buy)
         - Whipsaw prevention: don't fire opposite signals in close proximity
+
+        ✅ NEW: Delta filtering support
+        - Accepts estimated candle delta for filtering
+        - Passes to check_signal for entry validation
         """
         signals = []
         scan_range = 20.0  # Only check levels within 20 points
@@ -358,8 +433,8 @@ class TradingBotBacktester:
                         # Skip - too close to opposite signal
                         continue
 
-            # Check for entry signal
-            signal = self._check_signal(strategy, current_price, level, timestamp)
+            # Check for entry signal (pass delta for filtering)
+            signal = self._check_signal(strategy, current_price, level, timestamp, candle_delta=candle_delta)
 
             if signal:
                 signal_key = f"{signal['price']:.2f}_{signal['type']}_{signal['direction']}"
@@ -393,13 +468,16 @@ class TradingBotBacktester:
 
         return signals
 
-    def _check_signal(self, strategy, current_price, level, timestamp):
+    def _check_signal(self, strategy, current_price, level, timestamp, candle_delta=None):
         """
         Check if a level generates a signal
 
         ✅ INTEGRATION POINT 3: Process FLIP signals with order book analysis
+        ✅ NEW: Pass delta for entry filtering
         """
-        action, modifier, message = strategy.check_entry_signal(current_price, level)
+        action, modifier, message = strategy.check_entry_signal(current_price, level,
+                                                                 candle_delta=candle_delta,
+                                                                 session_delta=None)
 
         if action == "IMMEDIATE_ENTRY":
             return {

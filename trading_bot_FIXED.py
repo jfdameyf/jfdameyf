@@ -74,11 +74,33 @@ class StrategyManager:
         self.POC_SWEET_SPOT_MAX = 20.0
         self.POC_DANGER_THRESHOLD = 50.0
 
+        # ✅ NEW: Delta filtering configuration
+        self.use_delta_filter = True  # Enable/disable delta filtering
+        self.delta_mode = "static"  # "static" or "dynamic"
+        self.static_delta_threshold = 400  # Fixed threshold (user's previous finding)
+        self.dynamic_delta_threshold = None  # Calculated from previous day/week
+        self.dynamic_volume_threshold = None  # Calculated from previous day/week
+
+        # Calculate dynamic thresholds if in dynamic mode
+        if self.delta_mode == "dynamic":
+            logging.info("🔄 Calculating dynamic delta thresholds...")
+            self.dynamic_delta_threshold, self.dynamic_volume_threshold = self.calculate_dynamic_thresholds(lookback_days=1)
+            if self.dynamic_delta_threshold is None:
+                logging.warning("⚠️ Dynamic calculation failed, falling back to static threshold")
+                self.delta_mode = "static"
+
         # Load active recapture monitors (Persistence)
         self.active_monitors = self.load_state()
 
         if not self.use_poc_filter:
             logging.info("NOTE: POC Distance Filter is DISABLED. All Zones active regardless of trend extension.")
+
+        # Log delta filter status
+        if self.use_delta_filter:
+            if self.delta_mode == "static":
+                logging.info(f"✅ Delta Filter ENABLED (Static): Threshold = {self.static_delta_threshold}")
+            else:
+                logging.info(f"✅ Delta Filter ENABLED (Dynamic): Threshold = {self.dynamic_delta_threshold:.0f}")
 
     def load_latest_context(self):
         """Loads the most recent plan from the JSON file with validation."""
@@ -146,6 +168,68 @@ class StrategyManager:
                 return {}
         return {}
 
+    def calculate_dynamic_thresholds(self, lookback_days=1):
+        """
+        Calculate dynamic delta and volume thresholds from previous day/week data
+
+        ✅ NEW: Adaptive thresholds based on recent market conditions
+        - Calculates avg absolute delta per 1-min bar
+        - Uses multiplier (1.5x) to set threshold
+        - Adapts to changing volatility/volume conditions
+
+        Args:
+            lookback_days: Number of days to look back (1=yesterday, 5=last week)
+
+        Returns:
+            tuple: (delta_threshold, volume_threshold) or (None, None) if calc fails
+        """
+        try:
+            import databento as db
+            client = db.Historical(API_KEY)
+
+            # Get RTH data from previous day(s)
+            end_date = datetime.now(NY_TZ).date()
+            start_date = end_date - timedelta(days=lookback_days + 2)  # Buffer for weekends
+
+            # Fetch 1-minute OHLCV bars for RTH (9:30-16:00 ET)
+            start_dt = NY_TZ.localize(datetime.combine(start_date, time(9, 30)))
+            end_dt = NY_TZ.localize(datetime.combine(end_date, time(16, 0)))
+
+            bars = client.timeseries.get_range(
+                dataset="GLBX.MDP3",
+                schema="ohlcv-1m",
+                symbols=[SYMBOL],
+                stype_in="continuous",
+                start=start_dt,
+                end=end_dt
+            ).to_df()
+
+            if bars.empty:
+                logging.warning("No historical data for dynamic threshold calculation")
+                return None, None
+
+            # Calculate average delta and volume per bar
+            # Note: We approximate delta from volume (actual delta requires trade data)
+            avg_volume = bars['volume'].mean()
+
+            # Estimate delta magnitude as % of volume (heuristic: ~60% of volume is directional)
+            # User's threshold of 400 likely represents strong directional bias
+            estimated_avg_delta = avg_volume * 0.15  # Conservative estimate
+
+            # Apply multiplier to set threshold (1.5x avg for strong moves)
+            delta_threshold = estimated_avg_delta * 1.5
+            volume_threshold = avg_volume * 1.5
+
+            logging.info(f"✅ Dynamic Thresholds Calculated (last {lookback_days} days):")
+            logging.info(f"   Delta Threshold: {delta_threshold:.0f} (avg: {estimated_avg_delta:.0f})")
+            logging.info(f"   Volume Threshold: {volume_threshold:.0f} (avg: {avg_volume:.0f})")
+
+            return delta_threshold, volume_threshold
+
+        except Exception as e:
+            logging.error(f"Error calculating dynamic thresholds: {e}")
+            return None, None
+
     def save_state(self):
         """Saves current monitors to disk with timestamps."""
         try:
@@ -189,9 +273,13 @@ class StrategyManager:
         if "Zone 4" in zone_str: return 4
         return 1
 
-    def check_entry_signal(self, current_price, level_info):
+    def check_entry_signal(self, current_price, level_info, candle_delta=None, session_delta=None):
         """
         Decides entry type based on Zone with IMPROVED proximity checks.
+
+        ✅ NEW: Delta filtering to avoid counter-trend entries
+        - Checks candle delta for confirmation
+        - Supports static (400) and dynamic thresholds
         """
         zone = self.get_zone_number(level_info)
         level_price = level_info['price']
@@ -214,7 +302,26 @@ class StrategyManager:
         else:
             reason = ""  # No POC filter - don't add confusing message
 
-        # --- 2. ZONE LOGIC ---
+        # --- 2. DELTA FILTER (NEW) ---
+        if self.use_delta_filter and candle_delta is not None:
+            # Determine threshold based on mode
+            if self.delta_mode == "static":
+                delta_threshold = self.static_delta_threshold
+            elif self.delta_mode == "dynamic" and self.dynamic_delta_threshold is not None:
+                delta_threshold = self.dynamic_delta_threshold
+            else:
+                delta_threshold = self.static_delta_threshold  # Fallback
+
+            # Apply delta filter for Zone 1 & 2 (responsive trades)
+            if zone in [1, 2]:
+                if l_type == 'SUP':  # LONG
+                    if candle_delta < delta_threshold:
+                        return "NO_TRADE", 0.0, f"Delta too low for LONG ({candle_delta:.0f} < {delta_threshold:.0f})"
+                elif l_type == 'RES':  # SHORT
+                    if candle_delta > -delta_threshold:
+                        return "NO_TRADE", 0.0, f"Delta too high for SHORT ({candle_delta:.0f} > {-delta_threshold:.0f})"
+
+        # --- 3. ZONE LOGIC ---
 
         # ZONES 1 & 2: Responsive / Touch Trading
         # ✅ FIX 3: Tightened proximity thresholds to reduce false signals
@@ -224,7 +331,8 @@ class StrategyManager:
 
             if distance <= proximity_threshold:
                 poc_info = f" {reason}" if reason else ""
-                return "IMMEDIATE_ENTRY", modifier, f"Zone {zone}: Touch @ {level_price:.2f} ({distance:.2f}pts proximity){poc_info}"
+                delta_info = f" | Δ:{candle_delta:.0f}" if candle_delta is not None else ""
+                return "IMMEDIATE_ENTRY", modifier, f"Zone {zone}: Touch @ {level_price:.2f} ({distance:.2f}pts proximity){poc_info}{delta_info}"
             else:
                 return "WAIT", 0.0, f"Zone {zone}: Waiting for approach (dist: {distance:.1f})"
 
@@ -899,11 +1007,14 @@ class LiveBot:
                     self.process_signal(current_price, level)
 
     def process_signal(self, price, level):
-        action, mod, msg = self.strategy.check_entry_signal(price, level)
-
-        # Get current delta values for alert
+        # Get current delta values for filtering and alert
         candle_delta = self.current_candle['delta']
         session_delta = self.session_cumulative_delta
+
+        # ✅ UPDATED: Pass delta to check_entry_signal for filtering
+        action, mod, msg = self.strategy.check_entry_signal(price, level,
+                                                             candle_delta=candle_delta,
+                                                             session_delta=session_delta)
 
         if action == "IMMEDIATE_ENTRY":
             direction = "LONG" if level['type'] == 'SUP' else "SHORT"
