@@ -69,8 +69,8 @@ class TradingBotBacktester:
         # ✅ NEW: Trade tracking with MAE/MFE
         self.trades = []  # All completed trades
         self.open_position = None  # Current open trade
-        self.TARGET_PROFIT = 5.0  # 5 points target for ES
-        self.STOP_LOSS = 2.0  # 2 points stop for ES
+        self.TARGET_PROFIT = 4.0  # 4 points target for ES (adjusted from 5.0 based on MAE/MFE)
+        self.STOP_LOSS = 3.0  # 3 points stop for ES (adjusted from 2.0 based on MAE/MFE)
 
         # ✅ FIX 2: Session-wide signal deduplication
         self.fired_signals_session = {}  # {signal_key: timestamp}

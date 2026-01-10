@@ -37,7 +37,7 @@ os.makedirs(BACKTEST_OUTPUT, exist_ok=True)
 # ==============================================================================
 class TradingBotBacktester:
     def __init__(self, start_date, end_date, enable_poc_filter=False,
-                 signal_cooldown_minutes=60, target_points=10.0, stop_points=6.0):
+                 signal_cooldown_minutes=60, target_points=12.0, stop_points=12.0):
         """
         Initialize NQ backtester with trade outcome analysis
 
@@ -46,8 +46,8 @@ class TradingBotBacktester:
             end_date: datetime.date - Last day to test
             enable_poc_filter: bool - Enable POC distance filtering
             signal_cooldown_minutes: int - Minimum time between signals (default: 60)
-            target_points: float - Profit target in points (default: 10.0)
-            stop_points: float - Stop loss in points (default: 6.0)
+            target_points: float - Profit target in points (default: 12.0, adjusted from 10.0)
+            stop_points: float - Stop loss in points (default: 12.0, adjusted from 6.0)
         """
         self.start_date = start_date
         self.end_date = end_date
@@ -1008,8 +1008,8 @@ class TradingBotBacktester:
 # QUICK BACKTEST RUNNER
 # ==============================================================================
 def quick_backtest(days_back=7, enable_poc=False, cooldown_minutes=60,
-                   target_points=10.0, stop_points=6.0):
-    """Quick NQ backtest with trade analysis"""
+                   target_points=12.0, stop_points=12.0):
+    """Quick NQ backtest with trade analysis (adjusted stop/target from 10.0/6.0)"""
     end_date = datetime.now(NY_TZ).date() - timedelta(days=1)
     start_date = end_date - timedelta(days=days_back + 5)
 
