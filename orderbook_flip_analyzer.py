@@ -215,6 +215,75 @@ class OrderBookFlipAnalyzer:
             return None
 
     # ==========================================================================
+    # TRADE ENTRY/EXIT ANALYSIS (NEW)
+    # ==========================================================================
+
+    def analyze_trade_point(self, price, timestamp, direction, point_type='entry'):
+        """
+        Analyze orderbook quality at a trade entry or exit point.
+
+        Args:
+            price: Price level to analyze
+            timestamp: When the trade event occurred
+            direction: 'LONG' or 'SHORT'
+            point_type: 'entry' or 'exit'
+
+        Returns:
+            Dictionary with orderbook metrics, or None if data unavailable
+        """
+        try:
+            # Fetch orderbook snapshot (5 min before, 1 min after)
+            book_data = self._fetch_orderbook_snapshot(
+                start_time=timestamp - timedelta(minutes=5),
+                end_time=timestamp + timedelta(minutes=1),
+                focus_time=timestamp
+            )
+
+            # Fetch trade data for same window
+            trade_data = self._fetch_trades_snapshot(
+                start_time=timestamp - timedelta(minutes=5),
+                end_time=timestamp + timedelta(minutes=1)
+            )
+
+            if book_data.empty and trade_data.empty:
+                logging.warning(f"No orderbook data available for {point_type} at {price:.2f}")
+                return None
+
+            # Determine level type based on direction
+            level_type = 'SUP' if direction == 'LONG' else 'RES'
+
+            # Calculate all metrics using existing _analyze_phase method
+            metrics = self._analyze_phase(
+                book_data, trade_data, price, level_type, phase=point_type
+            )
+
+            # Add some context
+            metrics['price'] = price
+            metrics['timestamp'] = timestamp
+            metrics['direction'] = direction
+            metrics['point_type'] = point_type
+
+            return metrics
+
+        except Exception as e:
+            logging.warning(f"Error analyzing {point_type} point at {price:.2f}: {e}")
+            return None
+
+    def analyze_trade_entry(self, entry_price, entry_time, direction):
+        """Convenience method for analyzing trade entries."""
+        return self.analyze_trade_point(entry_price, entry_time, direction, point_type='entry')
+
+    def analyze_trade_exit(self, exit_price, exit_time, direction, exit_reason):
+        """
+        Convenience method for analyzing trade exits.
+        Includes exit reason context.
+        """
+        metrics = self.analyze_trade_point(exit_price, exit_time, direction, point_type='exit')
+        if metrics:
+            metrics['exit_reason'] = exit_reason
+        return metrics
+
+    # ==========================================================================
     # DATA FETCHING
     # ==========================================================================
 

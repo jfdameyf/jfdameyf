@@ -13,6 +13,7 @@ import joblib
 import json
 import os
 import sys
+import logging
 from datetime import datetime, time, timedelta
 import pytz
 import warnings
@@ -89,25 +90,33 @@ class TradingBotBacktester:
         self.WHIPSAW_PREVENTION_DISTANCE = 3.0  # Don't fire opposite signal within 3 points
 
         # ✅ INTEGRATION POINT 1: Order Book Analysis Setup
-        self.analyze_orderbook = analyze_orderbook
+        # Enable orderbook analysis by default (use same API key as backtest)
+        self.analyze_orderbook = analyze_orderbook if databento_api_key else False
         self.ob_analyzer = None
 
-        if analyze_orderbook:
-            if databento_api_key:
+        # Use API_KEY from module if no explicit key provided
+        api_key_to_use = databento_api_key if databento_api_key else (API_KEY if API_KEY and "YOUR_DATABENTO" not in API_KEY else None)
+
+        if self.analyze_orderbook or api_key_to_use:
+            if api_key_to_use:
                 try:
-                    from orderbook_flip_analyzer import create_analyzer_from_api_key
-                    self.ob_analyzer = create_analyzer_from_api_key(
-                        databento_api_key,
+                    from orderbook_flip_analyzer import OrderBookFlipAnalyzer
+                    self.ob_analyzer = OrderBookFlipAnalyzer(
+                        databento_client=self.client,
                         symbol=SYMBOL
                     )
+                    self.analyze_orderbook = True
                     print("✅ Order book analysis ENABLED")
                 except ImportError as e:
                     print(f"⚠️  Could not import OrderBookFlipAnalyzer: {e}")
                     print("   Order book analysis will be DISABLED")
                     self.analyze_orderbook = False
+                except Exception as e:
+                    print(f"⚠️  Error initializing OrderBookFlipAnalyzer: {e}")
+                    print("   Order book analysis will be DISABLED")
+                    self.analyze_orderbook = False
             else:
-                print("⚠️  Order book analysis requested but no API key provided")
-                print("   Pass databento_api_key parameter to enable")
+                print("⚠️  Order book analysis requested but no API key available")
                 self.analyze_orderbook = False
 
         print(f"🔬 BACKTESTER INITIALIZED")
@@ -733,6 +742,88 @@ class TradingBotBacktester:
                     dir_wr = (dir_wins / len(dir_trades)) * 100
                     print(f"   {direction}: {len(dir_trades)} trades | {dir_pnl:.2f} pts | {dir_wr:.1f}% WR")
 
+            # ✅ NEW: Orderbook Analysis Report
+            if 'entry_resting_liquidity' in trades_df.columns and trades_df['entry_resting_liquidity'].notna().any():
+                print(f"\n📖 ORDERBOOK QUALITY ANALYSIS")
+                print("="*60)
+
+                # Separate winners and losers
+                winners = trades_df[trades_df['pnl'] > 0]
+                losers = trades_df[trades_df['pnl'] < 0]
+
+                print(f"\n📊 ENTRY METRICS - Winners vs Losers:")
+                print(f"   {'Metric':<30} {'Winners':<15} {'Losers':<15} {'Difference':<15}")
+                print(f"   {'-'*75}")
+
+                # Entry metrics comparison
+                metrics_to_compare = [
+                    ('entry_resting_liquidity', 'Resting Liquidity', '{:.0f} contracts'),
+                    ('entry_imbalance', 'Imbalance Score', '{:.2f}'),
+                    ('entry_true_absorption', 'True Absorption', '{:.0f} contracts'),
+                    ('entry_aggressive_buy', 'Aggressive Buy Vol', '{:.0f} contracts'),
+                    ('entry_aggressive_sell', 'Aggressive Sell Vol', '{:.0f} contracts'),
+                ]
+
+                for col, label, fmt in metrics_to_compare:
+                    if col in trades_df.columns:
+                        winner_avg = winners[col].mean() if not winners.empty else 0
+                        loser_avg = losers[col].mean() if not losers.empty else 0
+                        diff = winner_avg - loser_avg
+
+                        winner_str = fmt.format(winner_avg) if not pd.isna(winner_avg) else 'N/A'
+                        loser_str = fmt.format(loser_avg) if not pd.isna(loser_avg) else 'N/A'
+                        diff_str = fmt.format(diff) if not pd.isna(diff) else 'N/A'
+
+                        print(f"   {label:<30} {winner_str:<15} {loser_str:<15} {diff_str:<15}")
+
+                # Depth quality breakdown
+                print(f"\n📊 ENTRY DEPTH QUALITY:")
+                if 'entry_depth_quality' in trades_df.columns:
+                    for outcome, df in [('Winners', winners), ('Losers', losers)]:
+                        if not df.empty and 'entry_depth_quality' in df.columns:
+                            quality_counts = df['entry_depth_quality'].value_counts()
+                            print(f"   {outcome}:")
+                            for quality, count in quality_counts.items():
+                                pct = (count / len(df)) * 100
+                                print(f"      {quality}: {count} ({pct:.1f}%)")
+
+                # Exit metrics comparison
+                print(f"\n📊 EXIT METRICS - Winners vs Losers:")
+                print(f"   {'Metric':<30} {'Winners':<15} {'Losers':<15} {'Difference':<15}")
+                print(f"   {'-'*75}")
+
+                exit_metrics_to_compare = [
+                    ('exit_resting_liquidity', 'Resting Liquidity', '{:.0f} contracts'),
+                    ('exit_imbalance', 'Imbalance Score', '{:.2f}'),
+                    ('exit_true_absorption', 'True Absorption', '{:.0f} contracts'),
+                ]
+
+                for col, label, fmt in exit_metrics_to_compare:
+                    if col in trades_df.columns:
+                        winner_avg = winners[col].mean() if not winners.empty else 0
+                        loser_avg = losers[col].mean() if not losers.empty else 0
+                        diff = winner_avg - loser_avg
+
+                        winner_str = fmt.format(winner_avg) if not pd.isna(winner_avg) else 'N/A'
+                        loser_str = fmt.format(loser_avg) if not pd.isna(loser_avg) else 'N/A'
+                        diff_str = fmt.format(diff) if not pd.isna(diff) else 'N/A'
+
+                        print(f"   {label:<30} {winner_str:<15} {loser_str:<15} {diff_str:<15}")
+
+                print("\n💡 INSIGHTS:")
+                # Generate insights based on metrics
+                if 'entry_imbalance' in trades_df.columns:
+                    winner_imb = winners['entry_imbalance'].mean() if not winners.empty else 0
+                    loser_imb = losers['entry_imbalance'].mean() if not losers.empty else 0
+                    if abs(winner_imb - loser_imb) > 0.1:
+                        print(f"   ✓ Winners entered with {'MORE' if winner_imb > loser_imb else 'LESS'} favorable imbalance")
+
+                if 'entry_resting_liquidity' in trades_df.columns:
+                    winner_liq = winners['entry_resting_liquidity'].mean() if not winners.empty else 0
+                    loser_liq = losers['entry_resting_liquidity'].mean() if not losers.empty else 0
+                    if abs(winner_liq - loser_liq) > 50:
+                        print(f"   ✓ Winners had {abs(winner_liq - loser_liq):.0f} more contracts of resting liquidity at entry")
+
             # Save trades CSV
             trades_csv = f"{BACKTEST_OUTPUT}/trades_{self.start_date}_to_{self.end_date}.csv"
             trades_df.to_csv(trades_csv, index=False)
@@ -859,8 +950,21 @@ class TradingBotBacktester:
         - Opening new position if no position open
         - Flipping position if opposite signal
         - Ignoring signal if same direction already open
+        - ✅ NEW: Orderbook analysis at entry
         """
         signal_direction = signal['direction']  # 'LONG' or 'SHORT'
+
+        # ✅ NEW: Analyze orderbook at entry point
+        entry_book_metrics = None
+        if self.ob_analyzer is not None:
+            try:
+                entry_book_metrics = self.ob_analyzer.analyze_trade_entry(
+                    entry_price=current_price,
+                    entry_time=timestamp,
+                    direction=signal_direction
+                )
+            except Exception as e:
+                logging.warning(f"Orderbook analysis failed at entry: {e}")
 
         # If no position, open new trade
         if self.open_position is None:
@@ -871,7 +975,8 @@ class TradingBotBacktester:
                 'entry_signal': signal,
                 'mae': 0.0,  # Maximum Adverse Excursion
                 'mfe': 0.0,  # Maximum Favorable Excursion
-                'running_pnl': 0.0
+                'running_pnl': 0.0,
+                'entry_book_metrics': entry_book_metrics  # ✅ NEW: Store orderbook metrics
             }
             return
 
@@ -962,6 +1067,8 @@ class TradingBotBacktester:
             exit_price: Price at which trade exits
             exit_time: Timestamp of exit
             reason: Exit reason (STOP/TARGET/EOD/FLIP/MANUAL)
+
+        ✅ NEW: Includes orderbook analysis at exit
         """
         if not self.open_position:
             return
@@ -978,6 +1085,19 @@ class TradingBotBacktester:
         # Calculate trade duration
         duration = (exit_time - self.open_position['entry_time']).total_seconds() / 60  # minutes
 
+        # ✅ NEW: Analyze orderbook at exit point
+        exit_book_metrics = None
+        if self.ob_analyzer is not None:
+            try:
+                exit_book_metrics = self.ob_analyzer.analyze_trade_exit(
+                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    direction=direction,
+                    exit_reason=reason
+                )
+            except Exception as e:
+                logging.warning(f"Orderbook analysis failed at exit: {e}")
+
         # Record completed trade
         trade_record = {
             'entry_time': self.open_position['entry_time'],
@@ -992,7 +1112,23 @@ class TradingBotBacktester:
             'exit_reason': reason,
             'entry_signal_type': self.open_position['entry_signal']['type'],
             'entry_zone': self.open_position['entry_signal']['zone'],
-            'entry_level_price': self.open_position['entry_signal']['price']
+            'entry_level_price': self.open_position['entry_signal']['price'],
+
+            # ✅ NEW: Orderbook metrics at entry
+            'entry_resting_liquidity': self.open_position['entry_book_metrics']['resting_liquidity'] if self.open_position['entry_book_metrics'] else None,
+            'entry_imbalance': self.open_position['entry_book_metrics']['imbalance_score'] if self.open_position['entry_book_metrics'] else None,
+            'entry_depth_quality': self.open_position['entry_book_metrics']['depth_quality'] if self.open_position['entry_book_metrics'] else None,
+            'entry_true_absorption': self.open_position['entry_book_metrics']['true_absorption'] if self.open_position['entry_book_metrics'] else None,
+            'entry_aggressive_buy': self.open_position['entry_book_metrics']['aggressive_buy_vol'] if self.open_position['entry_book_metrics'] else None,
+            'entry_aggressive_sell': self.open_position['entry_book_metrics']['aggressive_sell_vol'] if self.open_position['entry_book_metrics'] else None,
+
+            # ✅ NEW: Orderbook metrics at exit
+            'exit_resting_liquidity': exit_book_metrics['resting_liquidity'] if exit_book_metrics else None,
+            'exit_imbalance': exit_book_metrics['imbalance_score'] if exit_book_metrics else None,
+            'exit_depth_quality': exit_book_metrics['depth_quality'] if exit_book_metrics else None,
+            'exit_true_absorption': exit_book_metrics['true_absorption'] if exit_book_metrics else None,
+            'exit_aggressive_buy': exit_book_metrics['aggressive_buy_vol'] if exit_book_metrics else None,
+            'exit_aggressive_sell': exit_book_metrics['aggressive_sell_vol'] if exit_book_metrics else None,
         }
 
         self.trades.append(trade_record)
