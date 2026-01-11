@@ -42,18 +42,18 @@ class OrderBookFlipAnalyzer:
         logging.info(f"  Absorption thresholds: High={self.absorption_thresholds['high']}, Medium={self.absorption_thresholds['medium']}")
 
     def _get_tick_size(self, symbol):
-        """Dynamically fetch tick size from Databento"""
-        try:
-            definition = self.client.definition.list_instruments(
-                dataset="GLBX.MDP3",
-                symbols=[symbol],
-                start=datetime.now(pytz.UTC) - timedelta(days=1)
-            )
-            tick_size = float(definition[0]['min_price_increment'])
-            logging.info(f"Fetched tick size for {symbol}: {tick_size}")
-            return tick_size
-        except Exception as e:
-            logging.warning(f"Could not fetch tick size for {symbol}, defaulting to 0.25. Error: {e}")
+        """Get tick size for symbol (hardcoded for common futures)"""
+        # Known tick sizes for CME futures
+        if symbol.startswith("ES"):
+            return 0.25
+        elif symbol.startswith("NQ"):
+            return 0.25
+        elif symbol.startswith("GC"):
+            return 0.10
+        elif symbol.startswith("CL"):
+            return 0.01
+        else:
+            logging.warning(f"Unknown symbol {symbol}, defaulting tick size to 0.25")
             return 0.25
 
     def _get_large_order_threshold(self, symbol):
