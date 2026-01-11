@@ -1114,21 +1114,21 @@ class TradingBotBacktester:
             'entry_zone': self.open_position['entry_signal']['zone'],
             'entry_level_price': self.open_position['entry_signal']['price'],
 
-            # ✅ NEW: Orderbook metrics at entry
-            'entry_resting_liquidity': self.open_position['entry_book_metrics']['resting_liquidity'] if self.open_position['entry_book_metrics'] else None,
-            'entry_imbalance': self.open_position['entry_book_metrics']['imbalance_score'] if self.open_position['entry_book_metrics'] else None,
-            'entry_depth_quality': self.open_position['entry_book_metrics']['depth_quality'] if self.open_position['entry_book_metrics'] else None,
-            'entry_true_absorption': self.open_position['entry_book_metrics']['true_absorption'] if self.open_position['entry_book_metrics'] else None,
-            'entry_aggressive_buy': self.open_position['entry_book_metrics']['aggressive_buy_vol'] if self.open_position['entry_book_metrics'] else None,
-            'entry_aggressive_sell': self.open_position['entry_book_metrics']['aggressive_sell_vol'] if self.open_position['entry_book_metrics'] else None,
+            # ✅ NEW: Orderbook metrics at entry (using .get() to avoid KeyError)
+            'entry_resting_liquidity': self.open_position.get('entry_book_metrics', {}).get('resting_liquidity') if self.open_position.get('entry_book_metrics') else None,
+            'entry_imbalance': self.open_position.get('entry_book_metrics', {}).get('imbalance_score') if self.open_position.get('entry_book_metrics') else None,
+            'entry_depth_quality': self.open_position.get('entry_book_metrics', {}).get('depth_quality') if self.open_position.get('entry_book_metrics') else None,
+            'entry_true_absorption': self.open_position.get('entry_book_metrics', {}).get('true_absorption') if self.open_position.get('entry_book_metrics') else None,
+            'entry_aggressive_buy': self.open_position.get('entry_book_metrics', {}).get('aggressive_buy_vol') if self.open_position.get('entry_book_metrics') else None,
+            'entry_aggressive_sell': self.open_position.get('entry_book_metrics', {}).get('aggressive_sell_vol') if self.open_position.get('entry_book_metrics') else None,
 
             # ✅ NEW: Orderbook metrics at exit
-            'exit_resting_liquidity': exit_book_metrics['resting_liquidity'] if exit_book_metrics else None,
-            'exit_imbalance': exit_book_metrics['imbalance_score'] if exit_book_metrics else None,
-            'exit_depth_quality': exit_book_metrics['depth_quality'] if exit_book_metrics else None,
-            'exit_true_absorption': exit_book_metrics['true_absorption'] if exit_book_metrics else None,
-            'exit_aggressive_buy': exit_book_metrics['aggressive_buy_vol'] if exit_book_metrics else None,
-            'exit_aggressive_sell': exit_book_metrics['aggressive_sell_vol'] if exit_book_metrics else None,
+            'exit_resting_liquidity': exit_book_metrics.get('resting_liquidity') if exit_book_metrics else None,
+            'exit_imbalance': exit_book_metrics.get('imbalance_score') if exit_book_metrics else None,
+            'exit_depth_quality': exit_book_metrics.get('depth_quality') if exit_book_metrics else None,
+            'exit_true_absorption': exit_book_metrics.get('true_absorption') if exit_book_metrics else None,
+            'exit_aggressive_buy': exit_book_metrics.get('aggressive_buy_vol') if exit_book_metrics else None,
+            'exit_aggressive_sell': exit_book_metrics.get('aggressive_sell_vol') if exit_book_metrics else None,
         }
 
         self.trades.append(trade_record)
