@@ -299,15 +299,23 @@ class OrderBookFlipAnalyzer:
                 end=end_time
             ).to_df()
 
-            # Check for expected columns
-            if not data.empty and 'bid_px_00' not in data.columns:
-                logging.warning("Expected MBP-10 columns not found in order book data")
-                logging.warning(f"Available columns: {list(data.columns)}")
+            if data.empty:
+                logging.warning(f"⚠️  Orderbook data is EMPTY for {self.symbol}")
+                logging.warning(f"   Period: {start_time} to {end_time}")
+                logging.warning(f"   This is likely a Databento API limitation - MBP-10 may not be available for continuous contracts")
                 return pd.DataFrame()
 
+            # Check for expected columns
+            if 'bid_px_00' not in data.columns:
+                logging.warning("Expected MBP-10 columns not found in order book data")
+                logging.warning(f"Available columns: {list(data.columns)[:20]}")
+                return pd.DataFrame()
+
+            logging.debug(f"Fetched {len(data)} orderbook snapshots")
             return data
         except Exception as e:
             logging.warning(f"Orderbook fetch failed: {e}")
+            logging.debug(f"Full error: {e.__class__.__name__}: {e}")
             return pd.DataFrame()
 
     def _fetch_trades_snapshot(self, start_time, end_time):
@@ -392,6 +400,7 @@ class OrderBookFlipAnalyzer:
         This represents passive liquidity resting in the book.
         """
         if book_data.empty:
+            logging.debug(f"Orderbook data is empty for level {level_price}")
             return 0
 
         snapshot = book_data.iloc[-1]
@@ -400,6 +409,13 @@ class OrderBookFlipAnalyzer:
         # Use epsilon for float comparison (half a tick)
         epsilon = self.tick_size / 2
 
+        # Debug: Log available columns and sample prices
+        if logging.getLogger().level == logging.DEBUG:
+            available_cols = [col for col in snapshot.index if 'px' in col or 'sz' in col]
+            logging.debug(f"Available book columns: {available_cols[:20]}")  # Show first 20
+            if f'bid_px_00' in snapshot.index:
+                logging.debug(f"Sample bid_px_00: {snapshot.get('bid_px_00', 'N/A')}, Level: {level_price}")
+
         if level_type == 'SUP':
             # Look for bids at the support level
             for i in range(10):
@@ -407,6 +423,7 @@ class OrderBookFlipAnalyzer:
                 sz = snapshot.get(f'bid_sz_{i:02d}', 0)
                 if abs(px - level_price) < epsilon:
                     resting_vol += sz
+                    logging.debug(f"Found resting liquidity: {sz} @ {px}")
         else:  # RES
             # Look for asks at the resistance level
             for i in range(10):
@@ -414,6 +431,7 @@ class OrderBookFlipAnalyzer:
                 sz = snapshot.get(f'ask_sz_{i:02d}', 0)
                 if abs(px - level_price) < epsilon:
                     resting_vol += sz
+                    logging.debug(f"Found resting liquidity: {sz} @ {px}")
 
         return int(resting_vol)
 
