@@ -1140,7 +1140,8 @@ class TradingBotBacktester:
 # ==============================================================================
 # QUICK BACKTEST RUNNER
 # ==============================================================================
-def quick_backtest(days_back=7, enable_poc=False, enable_orderbook=False, ob_api_key=None):
+def quick_backtest(days_back=7, enable_poc=False, enable_orderbook=False, ob_api_key=None,
+                   use_delta_filter=True, delta_threshold=400):
     """
     Quick backtest for last N trading days
 
@@ -1149,6 +1150,8 @@ def quick_backtest(days_back=7, enable_poc=False, enable_orderbook=False, ob_api
         enable_poc: Enable POC distance filter
         enable_orderbook: Enable order book FLIP analysis (NEW)
         ob_api_key: Databento API key for order book data (NEW)
+        use_delta_filter: Enable delta filtering (default: True)
+        delta_threshold: Delta threshold (default: 400 for ES)
     """
     end_date = datetime.now(NY_TZ).date() - timedelta(days=1)  # Yesterday
     start_date = end_date - timedelta(days=days_back + 5)  # Add buffer for weekends
@@ -1158,7 +1161,10 @@ def quick_backtest(days_back=7, enable_poc=False, enable_orderbook=False, ob_api
         end_date,
         enable_poc,
         analyze_orderbook=enable_orderbook,
-        databento_api_key=ob_api_key
+        databento_api_key=ob_api_key,
+        use_delta_filter=use_delta_filter,
+        delta_mode="static",
+        static_delta_threshold=delta_threshold
     )
     backtester.run_full_backtest()
 
@@ -1181,6 +1187,14 @@ if __name__ == "__main__":
     choice = input("\nSelect Option [1-4]: ").strip()
 
     enable_poc = input("Enable POC Filter? [y/N]: ").strip().lower() == 'y'
+
+    # ✅ Delta filter prompts
+    enable_delta = input("Enable Delta Filter? [Y/n]: ").strip().lower() != 'n'  # Default YES for ES
+    delta_threshold = 400  # Default for ES
+    if enable_delta:
+        threshold_input = input("Delta Threshold [400] (suggested: 300-600): ").strip()
+        delta_threshold = int(threshold_input) if threshold_input else 400
+
     enable_ob = input("Enable Order Book Analysis? [y/N]: ").strip().lower() == 'y'
 
     ob_key = None
@@ -1192,11 +1206,13 @@ if __name__ == "__main__":
 
     if choice == "1":
         print("\n🔬 Running 7-Day Backtest...")
-        quick_backtest(days_back=7, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key)
+        quick_backtest(days_back=7, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key,
+                      use_delta_filter=enable_delta, delta_threshold=delta_threshold)
 
     elif choice == "2":
         print("\n🔬 Running 30-Day Backtest...")
-        quick_backtest(days_back=30, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key)
+        quick_backtest(days_back=30, enable_poc=enable_poc, enable_orderbook=enable_ob, ob_api_key=ob_key,
+                      use_delta_filter=enable_delta, delta_threshold=delta_threshold)
 
     elif choice == "3":
         start_str = input("Start Date (YYYY-MM-DD): ").strip()
@@ -1211,7 +1227,10 @@ if __name__ == "__main__":
                 end,
                 enable_poc,
                 analyze_orderbook=enable_ob,
-                databento_api_key=ob_key
+                databento_api_key=ob_key,
+                use_delta_filter=enable_delta,
+                delta_mode="static",
+                static_delta_threshold=delta_threshold
             )
             backtester.run_full_backtest()
         except ValueError:

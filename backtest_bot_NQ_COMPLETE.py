@@ -1275,19 +1275,26 @@ if __name__ == "__main__":
     cooldown_input = input("Signal Cooldown (minutes) [60]: ").strip()
     cooldown = int(cooldown_input) if cooldown_input else 60
 
-    target_input = input("Target (points) [10.0]: ").strip()
-    target = float(target_input) if target_input else 10.0
+    target_input = input("Target (points) [12.0]: ").strip()
+    target = float(target_input) if target_input else 12.0
 
-    stop_input = input("Stop (points) [6.0]: ").strip()
-    stop = float(stop_input) if stop_input else 6.0
+    stop_input = input("Stop (points) [12.0]: ").strip()
+    stop = float(stop_input) if stop_input else 12.0
+
+    # ✅ NEW: Delta filter prompts
+    enable_delta = input("Enable Delta Filter? [y/N]: ").strip().lower() == 'y'
+    delta_threshold = 1600  # Default
+    if enable_delta:
+        threshold_input = input("Delta Threshold [1600] (suggested: 800-2400): ").strip()
+        delta_threshold = int(threshold_input) if threshold_input else 1600
 
     if choice == "1":
         print(f"\n🔬 Running 7-Day NQ Backtest...")
-        quick_backtest(7, enable_poc, cooldown, target, stop)
+        quick_backtest(7, enable_poc, cooldown, target, stop, enable_delta, delta_threshold)
 
     elif choice == "2":
         print(f"\n🔬 Running 30-Day NQ Backtest...")
-        quick_backtest(30, enable_poc, cooldown, target, stop)
+        quick_backtest(30, enable_poc, cooldown, target, stop, enable_delta, delta_threshold)
 
     elif choice == "3":
         start_str = input("Start Date (YYYY-MM-DD): ").strip()
@@ -1297,14 +1304,14 @@ if __name__ == "__main__":
             start = datetime.strptime(start_str, "%Y-%m-%d").date()
             end = datetime.strptime(end_str, "%Y-%m-%d").date()
 
-            backtester = TradingBotBacktester(start, end, enable_poc, cooldown, target, stop)
+            backtester = TradingBotBacktester(start, end, enable_poc, cooldown, target, stop, enable_delta, delta_threshold)
             backtester.run_full_backtest()
         except ValueError:
             print("❌ Invalid date format!")
 
     elif choice == "4":
         print(f"\n🔬 Running 90-Day NQ Backtest...")
-        quick_backtest(90, enable_poc, cooldown, target, stop)
+        quick_backtest(90, enable_poc, cooldown, target, stop, enable_delta, delta_threshold)
 
     else:
         print("❌ Invalid choice")
