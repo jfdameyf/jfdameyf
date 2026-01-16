@@ -5,7 +5,8 @@ Compares trading performance:
 1. WITH order flow-based exit monitoring (dynamic exits)
 2. WITHOUT exit monitoring (fixed stop loss / take profit)
 
-This helps evaluate whether the exit monitoring system adds value.
+Uses OHLCV-1m data with simulated delta (buy/sell volume estimation).
+This is more practical than tick data for multi-week/month backtests.
 """
 
 import pandas as pd
@@ -22,6 +23,8 @@ import pytz
 import warnings
 import logging
 from enum import Enum
+import hashlib
+import pickle
 
 warnings.filterwarnings('ignore')
 
@@ -35,7 +38,7 @@ NY_TZ = pytz.timezone('America/New_York')
 # Strategy Parameters (match live bot)
 LEVEL_ABS_THRESH = 6000
 LEVEL_DELTA_THRESH = 700
-LEVEL_TIMEFRAME = 2
+LEVEL_TIMEFRAME = 2  # 2-minute candles
 
 BLIND_ABS_THRESH = 8000
 BLIND_DELTA_THRESH = 700
@@ -53,14 +56,17 @@ EXIT_EXHAUSTION_MIN_BARS = 3
 EXIT_DIVERGENCE_BARS = 4
 
 # Fixed Exit Parameters (for comparison - NO exit monitor)
-FIXED_STOP_LOSS_PTS = 4.0      # Fixed stop loss in points
-FIXED_TAKE_PROFIT_PTS = 8.0    # Fixed take profit in points
-FIXED_TIME_STOP_BARS = 15      # Exit after N bars if no target hit
+FIXED_STOP_LOSS_PTS = 4.0
+FIXED_TAKE_PROFIT_PTS = 8.0
+FIXED_TIME_STOP_BARS = 15
 
 # Backtest Settings
 SYMBOL = "ES.c.0"
 CONTEXT_FILE = "daily_context_v2.json"
 LEVELS_FILE = "critical_levels_master_enhanced.csv"
+CACHE_DIR = "backtest_cache"
+
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -88,14 +94,14 @@ class BacktestTrade:
     """Represents a completed trade for analysis."""
     entry_time: datetime
     exit_time: datetime
-    direction: str  # 'LONG' or 'SHORT'
+    direction: str
     entry_price: float
     exit_price: float
     pnl_points: float
     exit_reason: ExitReason
     bars_held: int
-    max_favorable_excursion: float  # Best price reached
-    max_adverse_excursion: float    # Worst price reached
+    max_favorable_excursion: float
+    max_adverse_excursion: float
     entry_absorption: int
     entry_delta: int
     signal_source: str
@@ -113,14 +119,11 @@ class BacktestPosition:
     signal_source: str
     target_level: Optional[float] = None
 
-    # Tracking
     bars_held: int = 0
     max_favorable: float = 0.0
     max_adverse: float = 0.0
     delta_history: List[int] = field(default_factory=list)
     price_history: List[float] = field(default_factory=list)
-
-    # Counter-absorption tracking
     counter_absorption: int = 0
 
     def __post_init__(self):
@@ -143,56 +146,85 @@ class BacktestResults:
     avg_bars_held: float = 0.0
     profit_factor: float = 0.0
     win_rate: float = 0.0
-    avg_mfe: float = 0.0  # Average max favorable excursion
-    avg_mae: float = 0.0  # Average max adverse excursion
+    avg_mfe: float = 0.0
+    avg_mae: float = 0.0
     exit_breakdown: Dict[str, int] = field(default_factory=dict)
     trades: List[BacktestTrade] = field(default_factory=list)
     equity_curve: List[float] = field(default_factory=list)
 
 
 # ==============================================================================
-# ABSORPTION MONITOR (Simplified for backtest)
+# SIMULATED DELTA FROM OHLCV
 # ==============================================================================
 
-class BacktestAbsorptionMonitor:
-    """Simplified absorption monitor for backtesting."""
+def estimate_delta_from_ohlcv(row: pd.Series) -> int:
+    """
+    Estimate order flow delta from OHLCV bar.
 
-    def __init__(self, price_key: float, level_type: str, threshold: int):
-        self.price_key = price_key
-        self.level_type = level_type
-        self.threshold = threshold
-        self.cumulative_vol = 0
-        self.state = "WATCHING"
-        self.last_update = None
+    Uses price action to infer buying/selling pressure:
+    - If close > open: more buying (positive delta)
+    - If close < open: more selling (negative delta)
+    - Magnitude scaled by volume and bar range
+    """
+    open_p = row['open']
+    high = row['high']
+    low = row['low']
+    close = row['close']
+    volume = row.get('volume', row.get('vol', 1000))
 
-    def update(self, size: int, side: str, ts: datetime):
-        # Check for reset (10 min timeout)
-        if self.last_update and (ts - self.last_update).total_seconds() > 600:
-            self.cumulative_vol = 0
-            self.state = "WATCHING"
-        self.last_update = ts
+    if high == low:
+        return 0
 
-        # Track opposing flow
-        is_opposing = (self.level_type == 'SUP' and side == 'B') or \
-                      (self.level_type == 'RES' and side == 'A')
-        if is_opposing:
-            self.cumulative_vol += size
+    # Calculate where close is relative to bar range
+    bar_range = high - low
+    close_position = (close - low) / bar_range  # 0 to 1
 
-        if self.state == "WATCHING" and self.cumulative_vol >= self.threshold:
-            self.state = "ABSORBING"
+    # Delta estimation: scale volume by close position
+    # close_position > 0.5 = more buying, < 0.5 = more selling
+    delta_ratio = (close_position - 0.5) * 2  # -1 to 1
 
-    def reset(self):
-        self.cumulative_vol = 0
-        self.state = "WATCHING"
+    # Scale by volume (normalize to typical ES volume)
+    estimated_delta = int(delta_ratio * volume * 0.5)
+
+    return estimated_delta
+
+
+def estimate_absorption_from_ohlcv(row: pd.Series, level_price: float,
+                                    level_type: str, tolerance: float = 3.0) -> int:
+    """
+    Estimate absorption volume at a level from OHLCV.
+
+    Absorption occurs when price touches a level but reverses.
+    """
+    high = row['high']
+    low = row['low']
+    close = row['close']
+    volume = row.get('volume', row.get('vol', 1000))
+
+    # Check if bar touched the level
+    if level_type == 'SUP':
+        # Support: check if low touched level
+        if abs(low - level_price) <= tolerance:
+            # Absorption = volume if price bounced (closed higher)
+            if close > low + 0.5:
+                return int(volume * 0.3)  # Estimate 30% was absorption
+    else:  # RES
+        # Resistance: check if high touched level
+        if abs(high - level_price) <= tolerance:
+            # Absorption = volume if price rejected (closed lower)
+            if close < high - 0.5:
+                return int(volume * 0.3)
+
+    return 0
 
 
 # ==============================================================================
-# BACKTEST ENGINE
+# BACKTEST ENGINE (OHLCV-based)
 # ==============================================================================
 
 class BacktestEngine:
     """
-    Runs backtest with configurable exit strategy.
+    Runs backtest using OHLCV data with simulated order flow.
     """
 
     def __init__(self, use_exit_monitor: bool = True):
@@ -201,19 +233,19 @@ class BacktestEngine:
         self.completed_trades: List[BacktestTrade] = []
         self.position_counter = 0
 
-        # Level monitors
-        self.level_monitors: Dict[str, BacktestAbsorptionMonitor] = {}
-        self.grid_monitors: Dict[float, Dict[str, BacktestAbsorptionMonitor]] = {}
-
-        # Candle tracking
-        self.candle_time: Optional[datetime] = None
-        self.candle_delta = 0
-        self.last_candle_delta = 0
-        self.current_price = 0.0
+        # Level tracking
+        self.level_absorption: Dict[str, int] = {}  # level_key -> cumulative absorption
+        self.level_last_touch: Dict[str, datetime] = {}
 
         # Context levels
         self.support_levels: List[float] = []
         self.resistance_levels: List[float] = []
+        self.all_levels: List[float] = []
+
+        # Bar aggregation for 2-min candles
+        self.bar_buffer: List[pd.Series] = []
+        self.last_2m_bar: Optional[pd.Series] = None
+        self.last_2m_delta = 0
 
         # Equity tracking
         self.equity = 0.0
@@ -221,16 +253,20 @@ class BacktestEngine:
         self.max_drawdown = 0.0
         self.equity_curve: List[float] = []
 
-    def load_levels(self, levels_file: str, context_file: str):
+    def load_levels(self, levels_file: str, context_file: str, current_price: float = 5000):
         """Load trading levels from files."""
         # Load from CSV
         if os.path.exists(levels_file):
-            df = pd.read_csv(levels_file)
-            if 'price' in df.columns:
-                all_levels = df['price'].tolist()
-                # We'll classify based on current price during backtest
-                self.all_levels = all_levels
-                logger.info(f"Loaded {len(all_levels)} levels from {levels_file}")
+            try:
+                df = pd.read_csv(levels_file)
+                if 'price' in df.columns:
+                    self.all_levels = df['price'].tolist()
+                    # Classify relative to approximate current price
+                    self.support_levels = sorted([p for p in self.all_levels if p < current_price], reverse=True)
+                    self.resistance_levels = sorted([p for p in self.all_levels if p > current_price])
+                    logger.info(f"Loaded {len(self.all_levels)} levels from {levels_file}")
+            except Exception as e:
+                logger.warning(f"Could not load levels file: {e}")
 
         # Load from context file
         if os.path.exists(context_file):
@@ -241,163 +277,181 @@ class BacktestEngine:
                         latest = data[list(data.keys())[-1]]
                         levels = latest.get('levels', {})
                         for l in levels.get('raw_sup', []):
-                            if 'price' in l:
+                            if 'price' in l and l['price'] not in self.support_levels:
                                 self.support_levels.append(l['price'])
                         for l in levels.get('raw_res', []):
-                            if 'price' in l:
+                            if 'price' in l and l['price'] not in self.resistance_levels:
                                 self.resistance_levels.append(l['price'])
+                        self.support_levels = sorted(self.support_levels, reverse=True)
+                        self.resistance_levels = sorted(self.resistance_levels)
                 logger.info(f"Context: {len(self.support_levels)} support, {len(self.resistance_levels)} resistance")
             except Exception as e:
                 logger.warning(f"Could not load context: {e}")
 
-        # Initialize level monitors
+        # Initialize absorption tracking for all levels
         for price in self.support_levels:
-            key = f"{price}_SUP"
-            self.level_monitors[key] = BacktestAbsorptionMonitor(price, 'SUP', LEVEL_ABS_THRESH)
+            self.level_absorption[f"{price}_SUP"] = 0
         for price in self.resistance_levels:
-            key = f"{price}_RES"
-            self.level_monitors[key] = BacktestAbsorptionMonitor(price, 'RES', LEVEL_ABS_THRESH)
+            self.level_absorption[f"{price}_RES"] = 0
 
     def _find_target(self, entry_price: float, direction: str) -> Optional[float]:
         """Find target level for position."""
         if direction == 'LONG':
-            for level in sorted(self.resistance_levels):
+            for level in self.resistance_levels:
                 if level > entry_price + 2.0:
                     return level
         else:
-            for level in sorted(self.support_levels, reverse=True):
+            for level in self.support_levels:
                 if level < entry_price - 2.0:
                     return level
         return None
 
-    def _floor_candle(self, ts: datetime) -> datetime:
-        """Floor timestamp to candle boundary."""
-        minute = (ts.minute // LEVEL_TIMEFRAME) * LEVEL_TIMEFRAME
-        return ts.replace(minute=minute, second=0, microsecond=0)
+    def process_bar(self, bar: pd.Series, timestamp: datetime):
+        """Process a single 1-minute OHLCV bar."""
+        self.bar_buffer.append(bar)
 
-    def process_tick(self, price: float, size: int, side: str, ts: datetime):
-        """Process a single tick."""
-        self.current_price = price
+        # Aggregate to 2-minute bars
+        if len(self.bar_buffer) >= 2:
+            # Create aggregated 2m bar
+            bars = self.bar_buffer[-2:]
+            agg_bar = pd.Series({
+                'open': bars[0]['open'],
+                'high': max(b['high'] for b in bars),
+                'low': min(b['low'] for b in bars),
+                'close': bars[-1]['close'],
+                'volume': sum(b.get('volume', b.get('vol', 0)) for b in bars)
+            })
 
-        # Handle candle boundaries
-        candle_now = self._floor_candle(ts)
-        if self.candle_time is None:
-            self.candle_time = candle_now
+            # Calculate 2m delta
+            self.last_2m_delta = sum(estimate_delta_from_ohlcv(b) for b in bars)
+            self.last_2m_bar = agg_bar
 
-        if candle_now > self.candle_time:
-            # Candle closed - check signals and exits
-            self.last_candle_delta = self.candle_delta
-            self._on_candle_close(ts)
-            self.candle_time = candle_now
-            self.candle_delta = 0
+            # Process on 2m bar close
+            self._on_2m_bar_close(agg_bar, timestamp)
 
-        # Update candle delta
-        if side == 'A':
-            self.candle_delta += size
-        else:
-            self.candle_delta -= size
+            # Keep only last bar for next aggregation
+            self.bar_buffer = [self.bar_buffer[-1]]
 
-        # Update level monitors
-        for key, monitor in self.level_monitors.items():
-            if abs(price - monitor.price_key) <= LEVEL_TOLERANCE:
-                monitor.update(size, side, ts)
+        # Update level absorption estimates from 1m bar
+        self._update_level_absorption(bar, timestamp)
 
-        # Update grid monitors
-        grid_key = round(price / 2.0) * 2.0
-        if grid_key not in self.grid_monitors:
-            self.grid_monitors[grid_key] = {
-                'SUP': BacktestAbsorptionMonitor(grid_key, 'SUP', BLIND_ABS_THRESH),
-                'RES': BacktestAbsorptionMonitor(grid_key, 'RES', BLIND_ABS_THRESH)
-            }
-        self.grid_monitors[grid_key]['SUP'].update(size, side, ts)
-        self.grid_monitors[grid_key]['RES'].update(size, side, ts)
+        # Update position tracking
+        self._update_positions(bar, timestamp)
 
-        # Update position tracking (for exit monitor mode)
-        if self.use_exit_monitor:
-            self._update_position_tick(price, size, side, ts)
+    def _update_level_absorption(self, bar: pd.Series, timestamp: datetime):
+        """Update absorption estimates at levels."""
+        # Reset stale levels (10 min timeout)
+        stale_keys = []
+        for key, last_touch in self.level_last_touch.items():
+            if (timestamp - last_touch).total_seconds() > 600:
+                stale_keys.append(key)
+        for key in stale_keys:
+            self.level_absorption[key] = 0
+            del self.level_last_touch[key]
 
-    def _update_position_tick(self, price: float, size: int, side: str, ts: datetime):
-        """Update positions on each tick (exit monitor mode)."""
+        # Check support levels
+        for price in self.support_levels[:10]:  # Check nearest 10
+            key = f"{price}_SUP"
+            absorption = estimate_absorption_from_ohlcv(bar, price, 'SUP', LEVEL_TOLERANCE)
+            if absorption > 0:
+                self.level_absorption[key] = self.level_absorption.get(key, 0) + absorption
+                self.level_last_touch[key] = timestamp
+
+        # Check resistance levels
+        for price in self.resistance_levels[:10]:
+            key = f"{price}_RES"
+            absorption = estimate_absorption_from_ohlcv(bar, price, 'RES', LEVEL_TOLERANCE)
+            if absorption > 0:
+                self.level_absorption[key] = self.level_absorption.get(key, 0) + absorption
+                self.level_last_touch[key] = timestamp
+
+    def _update_positions(self, bar: pd.Series, timestamp: datetime):
+        """Update position MFE/MAE and counter-absorption."""
+        close = bar['close']
+        high = bar['high']
+        low = bar['low']
+        volume = bar.get('volume', bar.get('vol', 1000))
+
         for pos_id, pos in self.positions.items():
-            # Update MFE/MAE
             if pos.direction == 'LONG':
-                pos.max_favorable = max(pos.max_favorable, price)
-                pos.max_adverse = min(pos.max_adverse, price)
-                # Track counter-absorption (buyers absorbed above = resistance forming)
-                if price > pos.entry_price + 2.0 and side == 'A':
-                    pos.counter_absorption += size
+                pos.max_favorable = max(pos.max_favorable, high)
+                pos.max_adverse = min(pos.max_adverse, low)
+                # Counter-absorption: estimate resistance forming above
+                if high > pos.entry_price + 2.0:
+                    # If price went up but closed lower, that's absorption
+                    if close < high - 0.5:
+                        pos.counter_absorption += int(volume * 0.2)
             else:
-                pos.max_favorable = min(pos.max_favorable, price)
-                pos.max_adverse = max(pos.max_adverse, price)
-                # Track counter-absorption (sellers absorbed below = support forming)
-                if price < pos.entry_price - 2.0 and side == 'B':
-                    pos.counter_absorption += size
+                pos.max_favorable = min(pos.max_favorable, low)
+                pos.max_adverse = max(pos.max_adverse, high)
+                # Counter-absorption: estimate support forming below
+                if low < pos.entry_price - 2.0:
+                    if close > low + 0.5:
+                        pos.counter_absorption += int(volume * 0.2)
 
-    def _on_candle_close(self, ts: datetime):
-        """Process candle close - check entries and exits."""
+    def _on_2m_bar_close(self, bar: pd.Series, timestamp: datetime):
+        """Process 2-minute bar close - check entries and exits."""
+        close = bar['close']
+
         # Check for new entry signals
-        self._check_entry_signals(ts)
+        self._check_entry_signals(bar, timestamp)
 
         # Update positions and check exits
         positions_to_close = []
 
         for pos_id, pos in self.positions.items():
             pos.bars_held += 1
-            pos.delta_history.append(self.last_candle_delta)
-            pos.price_history.append(self.current_price)
+            pos.delta_history.append(self.last_2m_delta)
+            pos.price_history.append(close)
 
-            # Keep history bounded
             if len(pos.delta_history) > 20:
                 pos.delta_history.pop(0)
             if len(pos.price_history) > 20:
                 pos.price_history.pop(0)
 
-            # Check exit conditions
-            exit_reason = self._check_exit(pos)
+            exit_reason = self._check_exit(pos, close)
             if exit_reason:
-                positions_to_close.append((pos_id, exit_reason))
+                positions_to_close.append((pos_id, exit_reason, close))
 
-        # Close positions
-        for pos_id, reason in positions_to_close:
-            self._close_position(pos_id, reason, ts)
+        for pos_id, reason, price in positions_to_close:
+            self._close_position(pos_id, reason, timestamp, price)
 
-    def _check_entry_signals(self, ts: datetime):
+    def _check_entry_signals(self, bar: pd.Series, timestamp: datetime):
         """Check for entry signals."""
-        # Skip if we already have a position (single position mode for simplicity)
         if self.positions:
-            return
+            return  # Single position mode
 
-        # Check level monitors
-        for key, monitor in self.level_monitors.items():
-            if monitor.state == "ABSORBING":
-                l_type = 'SUP' if '_SUP' in key else 'RES'
+        close = bar['close']
+        delta = self.last_2m_delta
+
+        # Check level signals
+        for key, absorption in self.level_absorption.items():
+            if absorption >= LEVEL_ABS_THRESH:
+                price_str, l_type = key.rsplit('_', 1)
+                level_price = float(price_str)
 
                 # Check delta confirmation
-                if l_type == 'SUP' and self.last_candle_delta >= LEVEL_DELTA_THRESH:
-                    self._open_position('LONG', monitor.price_key, ts,
-                                       monitor.cumulative_vol, self.last_candle_delta, 'LEVEL')
-                    monitor.reset()
+                if l_type == 'SUP' and delta >= LEVEL_DELTA_THRESH:
+                    self._open_position('LONG', level_price, timestamp, absorption, delta, 'LEVEL')
+                    self.level_absorption[key] = 0  # Reset
                     return
-                elif l_type == 'RES' and self.last_candle_delta <= -LEVEL_DELTA_THRESH:
-                    self._open_position('SHORT', monitor.price_key, ts,
-                                       monitor.cumulative_vol, self.last_candle_delta, 'LEVEL')
-                    monitor.reset()
+                elif l_type == 'RES' and delta <= -LEVEL_DELTA_THRESH:
+                    self._open_position('SHORT', level_price, timestamp, absorption, delta, 'LEVEL')
+                    self.level_absorption[key] = 0
                     return
 
-        # Check grid monitors
-        for grid_price, pair in self.grid_monitors.items():
-            for l_type, monitor in pair.items():
-                if monitor.state == "ABSORBING":
-                    if l_type == 'SUP' and self.last_candle_delta >= BLIND_DELTA_THRESH:
-                        self._open_position('LONG', grid_price, ts,
-                                           monitor.cumulative_vol, self.last_candle_delta, 'GRID')
-                        monitor.reset()
-                        return
-                    elif l_type == 'RES' and self.last_candle_delta <= -BLIND_DELTA_THRESH:
-                        self._open_position('SHORT', grid_price, ts,
-                                           monitor.cumulative_vol, self.last_candle_delta, 'GRID')
-                        monitor.reset()
-                        return
+        # Check blind grid signals (high absorption anywhere)
+        # For OHLCV backtest, we simplify this to large delta + price at round number
+        grid_price = round(close / 2.0) * 2.0
+        bar_volume = bar.get('volume', bar.get('vol', 0))
+
+        if bar_volume > 50000:  # High volume bar
+            if delta >= BLIND_DELTA_THRESH * 1.5:  # Higher threshold for blind
+                self._open_position('LONG', grid_price, timestamp, int(bar_volume * 0.3), delta, 'GRID')
+                return
+            elif delta <= -BLIND_DELTA_THRESH * 1.5:
+                self._open_position('SHORT', grid_price, timestamp, int(bar_volume * 0.3), delta, 'GRID')
+                return
 
     def _open_position(self, direction: str, price: float, ts: datetime,
                       absorption: int, delta: int, source: str):
@@ -420,11 +474,8 @@ class BacktestEngine:
             max_adverse=price
         )
 
-    def _check_exit(self, pos: BacktestPosition) -> Optional[ExitReason]:
+    def _check_exit(self, pos: BacktestPosition, price: float) -> Optional[ExitReason]:
         """Check if position should be exited."""
-        price = self.current_price
-
-        # Calculate current P&L
         if pos.direction == 'LONG':
             pnl = price - pos.entry_price
         else:
@@ -437,18 +488,12 @@ class BacktestEngine:
 
     def _check_exit_fixed(self, pos: BacktestPosition, price: float, pnl: float) -> Optional[ExitReason]:
         """Fixed stop/target exit strategy."""
-        # Stop loss
         if pnl <= -FIXED_STOP_LOSS_PTS:
             return ExitReason.STOP_LOSS
-
-        # Take profit
         if pnl >= FIXED_TAKE_PROFIT_PTS:
             return ExitReason.TAKE_PROFIT
-
-        # Time stop
         if pos.bars_held >= FIXED_TIME_STOP_BARS:
             return ExitReason.TIME_STOP
-
         return None
 
     def _check_exit_monitor(self, pos: BacktestPosition, price: float, pnl: float) -> Optional[ExitReason]:
@@ -486,48 +531,42 @@ class BacktestEngine:
             recent = pos.delta_history[-EXIT_EXHAUSTION_MIN_BARS:]
             if pos.direction == 'LONG' and pos.entry_delta > 0:
                 avg = sum(max(0, d) for d in recent) / len(recent)
-                decay = avg / pos.entry_delta
-                extended = price > pos.entry_price + 3.0
-                if decay < EXIT_EXHAUSTION_DECAY_PCT and extended:
+                decay = avg / pos.entry_delta if pos.entry_delta else 1
+                if decay < EXIT_EXHAUSTION_DECAY_PCT and price > pos.entry_price + 3.0:
                     return ExitReason.EXHAUSTION
             elif pos.direction == 'SHORT' and pos.entry_delta < 0:
                 avg = sum(min(0, d) for d in recent) / len(recent)
-                decay = avg / pos.entry_delta
-                extended = price < pos.entry_price - 3.0
-                if decay < EXIT_EXHAUSTION_DECAY_PCT and extended:
+                decay = avg / pos.entry_delta if pos.entry_delta else 1
+                if decay < EXIT_EXHAUSTION_DECAY_PCT and price < pos.entry_price - 3.0:
                     return ExitReason.EXHAUSTION
 
         # 5. TARGET REACHED
-        if pos.target_level:
-            dist = abs(price - pos.target_level)
-            if dist <= 3.0:
-                return ExitReason.TARGET_REACHED
+        if pos.target_level and abs(price - pos.target_level) <= 3.0:
+            return ExitReason.TARGET_REACHED
 
         # 6. DIVERGENCE
         if len(pos.delta_history) >= EXIT_DIVERGENCE_BARS:
             prices = pos.price_history[-EXIT_DIVERGENCE_BARS:]
             deltas = pos.delta_history[-EXIT_DIVERGENCE_BARS:]
 
-            if pos.direction == 'LONG':
-                price_up = prices[-1] > prices[0]
-                peaks = [d for d in deltas if d > 0]
-                if len(peaks) >= 2 and price_up:
-                    if peaks[-1] < peaks[0] * 0.7:
+            if len(prices) >= EXIT_DIVERGENCE_BARS:
+                if pos.direction == 'LONG':
+                    price_up = prices[-1] > prices[0]
+                    peaks = [d for d in deltas if d > 0]
+                    if len(peaks) >= 2 and price_up and peaks[-1] < peaks[0] * 0.7:
                         return ExitReason.DIVERGENCE
-            else:
-                price_down = prices[-1] < prices[0]
-                troughs = [d for d in deltas if d < 0]
-                if len(troughs) >= 2 and price_down:
-                    if troughs[-1] > troughs[0] * 0.7:
+                else:
+                    price_down = prices[-1] < prices[0]
+                    troughs = [d for d in deltas if d < 0]
+                    if len(troughs) >= 2 and price_down and troughs[-1] > troughs[0] * 0.7:
                         return ExitReason.DIVERGENCE
 
         return None
 
-    def _close_position(self, pos_id: str, reason: ExitReason, ts: datetime):
+    def _close_position(self, pos_id: str, reason: ExitReason, ts: datetime, exit_price: float):
         """Close a position and record the trade."""
         pos = self.positions.pop(pos_id)
 
-        exit_price = self.current_price
         if pos.direction == 'LONG':
             pnl = exit_price - pos.entry_price
             mfe = pos.max_favorable - pos.entry_price
@@ -555,17 +594,16 @@ class BacktestEngine:
 
         self.completed_trades.append(trade)
 
-        # Update equity
         self.equity += pnl
         self.equity_curve.append(self.equity)
         self.peak_equity = max(self.peak_equity, self.equity)
         drawdown = self.peak_equity - self.equity
         self.max_drawdown = max(self.max_drawdown, drawdown)
 
-    def finalize(self, ts: datetime):
+    def finalize(self, ts: datetime, last_price: float):
         """Close any remaining positions at end of data."""
         for pos_id in list(self.positions.keys()):
-            self._close_position(pos_id, ExitReason.END_OF_DATA, ts)
+            self._close_position(pos_id, ExitReason.END_OF_DATA, ts, last_price)
 
     def get_results(self) -> BacktestResults:
         """Calculate and return backtest results."""
@@ -598,7 +636,6 @@ class BacktestEngine:
         results.avg_mfe = sum(t.max_favorable_excursion for t in self.completed_trades) / len(self.completed_trades)
         results.avg_mae = sum(t.max_adverse_excursion for t in self.completed_trades) / len(self.completed_trades)
 
-        # Exit breakdown
         for trade in self.completed_trades:
             reason = trade.exit_reason.value
             results.exit_breakdown[reason] = results.exit_breakdown.get(reason, 0) + 1
@@ -607,13 +644,34 @@ class BacktestEngine:
 
 
 # ==============================================================================
-# DATA LOADING
+# DATA LOADING WITH CACHING
 # ==============================================================================
 
-def load_historical_data(start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-    """Load historical tick data from Databento."""
+def get_cache_path(start_date: str, end_date: str) -> str:
+    """Generate cache file path."""
+    key = f"{SYMBOL}_{start_date}_{end_date}"
+    hash_key = hashlib.md5(key.encode()).hexdigest()[:8]
+    return os.path.join(CACHE_DIR, f"ohlcv_{hash_key}.pkl")
+
+
+def load_historical_data(start_date: str, end_date: str, use_cache: bool = True) -> Optional[pd.DataFrame]:
+    """Load historical OHLCV-1m data from Databento with caching."""
+
+    cache_path = get_cache_path(start_date, end_date)
+
+    # Try cache first
+    if use_cache and os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                df = pickle.load(f)
+            logger.info(f"Loaded {len(df):,} bars from cache")
+            return df
+        except Exception as e:
+            logger.warning(f"Cache load failed: {e}")
+
     if not API_KEY:
-        logger.error("DATABENTO_API_KEY not set")
+        logger.error("DATABENTO_API_KEY environment variable not set")
+        print("\nERROR: Set DATABENTO_API_KEY environment variable")
         return None
 
     try:
@@ -622,11 +680,12 @@ def load_historical_data(start_date: str, end_date: str) -> Optional[pd.DataFram
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
-        logger.info(f"Fetching tick data from {start_date} to {end_date}...")
+        logger.info(f"Fetching OHLCV-1m data from {start_date} to {end_date}...")
+        print(f"  This may take a moment for longer date ranges...")
 
         data = client.timeseries.get_range(
             dataset="GLBX.MDP3",
-            schema="trades",
+            schema="ohlcv-1m",
             symbols=[SYMBOL],
             stype_in="continuous",
             start=start_dt,
@@ -642,11 +701,23 @@ def load_historical_data(start_date: str, end_date: str) -> Optional[pd.DataFram
         # Filter to RTH only (9:30 AM - 4:00 PM ET)
         df = df.between_time('09:30', '16:00')
 
-        logger.info(f"Loaded {len(df):,} ticks")
+        logger.info(f"Loaded {len(df):,} 1-minute bars")
+
+        # Cache the data
+        if use_cache:
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(df, f)
+                logger.info(f"Cached data to {cache_path}")
+            except Exception as e:
+                logger.warning(f"Cache save failed: {e}")
+
         return df
 
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -672,7 +743,7 @@ def print_results(results: BacktestResults, label: str):
     print(f"  ")
     print(f"  Avg Win:           {results.avg_win:+.2f} pts")
     print(f"  Avg Loss:          {results.avg_loss:-.2f} pts")
-    print(f"  Avg Bars Held:     {results.avg_bars_held:.1f}")
+    print(f"  Avg Bars Held:     {results.avg_bars_held:.1f} (2m bars)")
     print(f"  Avg MFE:           {results.avg_mfe:+.2f} pts")
     print(f"  Avg MAE:           {results.avg_mae:-.2f} pts")
     print(f"  ")
@@ -715,7 +786,6 @@ def print_comparison(with_monitor: BacktestResults, without_monitor: BacktestRes
         v1 = fmt(val1, is_pct, is_pts)
         v2 = fmt(val2, is_pct, is_pts)
 
-        # Highlight winner
         if name in ["Win Rate", "Total P&L (pts)", "Profit Factor", "Avg Win (pts)", "Avg MFE (pts)"]:
             better = ">" if val1 > val2 else "<" if val2 > val1 else "="
         elif name in ["Max Drawdown (pts)", "Avg Loss (pts)", "Avg MAE (pts)"]:
@@ -723,15 +793,15 @@ def print_comparison(with_monitor: BacktestResults, without_monitor: BacktestRes
         else:
             better = "="
 
-        indicator = " *" if better != "=" else ""
+        indicator = " *" if better == ">" else " x" if better == "<" else ""
         print(f"  {name:<25} {v1:>18} {v2:>18}{indicator}")
 
     print(f"  {'-'*65}")
-    print(f"  * indicates better performance")
+    print(f"  * = Exit Monitor better | x = Fixed Stops better")
 
-    # Net improvement
     pnl_diff = with_monitor.total_pnl - without_monitor.total_pnl
-    print(f"\n  P&L Difference: {pnl_diff:+.2f} pts {'(Exit Monitor better)' if pnl_diff > 0 else '(Fixed Stops better)'}")
+    winner = "Exit Monitor" if pnl_diff > 0 else "Fixed Stops"
+    print(f"\n  P&L Difference: {pnl_diff:+.2f} pts ({winner} wins)")
 
 
 def save_trades_to_csv(results: BacktestResults, filename: str):
@@ -773,6 +843,7 @@ def run_backtest(start_date: str, end_date: str, save_trades: bool = True):
     print("  ES ALGO ASSISTANT - EXIT MONITOR BACKTEST")
     print("="*70)
     print(f"  Period: {start_date} to {end_date}")
+    print(f"  Data: OHLCV-1m bars (RTH only)")
     print(f"  ")
     print(f"  Strategy Parameters:")
     print(f"    Level Absorption:    {LEVEL_ABS_THRESH}")
@@ -786,7 +857,7 @@ def run_backtest(start_date: str, end_date: str, save_trades: bool = True):
     print(f"    Failed Follow-through: {EXIT_FAILED_FOLLOWTHROUGH_BARS} bars / {EXIT_FAILED_FOLLOWTHROUGH_PTS}pts")
     print(f"    Exhaustion Decay:    {EXIT_EXHAUSTION_DECAY_PCT:.0%}")
     print(f"  ")
-    print(f"  Fixed Exit Parameters (for comparison):")
+    print(f"  Fixed Exit Parameters (baseline):")
     print(f"    Stop Loss:           {FIXED_STOP_LOSS_PTS} pts")
     print(f"    Take Profit:         {FIXED_TAKE_PROFIT_PTS} pts")
     print(f"    Time Stop:           {FIXED_TIME_STOP_BARS} bars")
@@ -795,35 +866,43 @@ def run_backtest(start_date: str, end_date: str, save_trades: bool = True):
     df = load_historical_data(start_date, end_date)
     if df is None or df.empty:
         print("\nNo data available for backtest.")
-        return
+        return None, None
+
+    # Get approximate current price for level classification
+    current_price = df['close'].iloc[0]
 
     # Run WITH exit monitor
     print("\n[1/2] Running backtest WITH Exit Monitor...")
     engine_with = BacktestEngine(use_exit_monitor=True)
-    engine_with.load_levels(LEVELS_FILE, CONTEXT_FILE)
+    engine_with.load_levels(LEVELS_FILE, CONTEXT_FILE, current_price)
 
-    for idx, row in df.iterrows():
-        price = row['price'] / 1e9 if row['price'] > 10000 else row['price']
-        size = row['size']
-        side = row['side']
-        engine_with.process_tick(price, size, side, idx)
+    bar_count = 0
+    total_bars = len(df)
+    for timestamp, row in df.iterrows():
+        engine_with.process_bar(row, timestamp)
+        bar_count += 1
+        if bar_count % 5000 == 0:
+            print(f"  Processing: {bar_count:,}/{total_bars:,} bars ({bar_count/total_bars*100:.0f}%)", end='\r')
 
-    engine_with.finalize(df.index[-1])
+    engine_with.finalize(df.index[-1], df['close'].iloc[-1])
     results_with = engine_with.get_results()
+    print(f"  Completed: {results_with.total_trades} trades                    ")
 
     # Run WITHOUT exit monitor
     print("[2/2] Running backtest WITHOUT Exit Monitor (Fixed Stops)...")
     engine_without = BacktestEngine(use_exit_monitor=False)
-    engine_without.load_levels(LEVELS_FILE, CONTEXT_FILE)
+    engine_without.load_levels(LEVELS_FILE, CONTEXT_FILE, current_price)
 
-    for idx, row in df.iterrows():
-        price = row['price'] / 1e9 if row['price'] > 10000 else row['price']
-        size = row['size']
-        side = row['side']
-        engine_without.process_tick(price, size, side, idx)
+    bar_count = 0
+    for timestamp, row in df.iterrows():
+        engine_without.process_bar(row, timestamp)
+        bar_count += 1
+        if bar_count % 5000 == 0:
+            print(f"  Processing: {bar_count:,}/{total_bars:,} bars ({bar_count/total_bars*100:.0f}%)", end='\r')
 
-    engine_without.finalize(df.index[-1])
+    engine_without.finalize(df.index[-1], df['close'].iloc[-1])
     results_without = engine_without.get_results()
+    print(f"  Completed: {results_without.total_trades} trades                    ")
 
     # Print results
     print_results(results_with, "WITH EXIT MONITOR (Dynamic Exits)")
@@ -844,16 +923,18 @@ def main():
     print("\n" + "="*50)
     print("  EXIT MONITOR BACKTEST")
     print("="*50)
+    print("\nThis uses OHLCV-1m data with simulated order flow.")
+    print("Longer date ranges are now supported.\n")
 
     # Get date range from user
-    print("\nEnter backtest date range:")
-    start = input("  Start Date (YYYY-MM-DD) [default: 2024-01-02]: ").strip()
-    end = input("  End Date (YYYY-MM-DD) [default: 2024-01-05]: ").strip()
+    print("Enter backtest date range:")
+    start = input("  Start Date (YYYY-MM-DD) [default: 2025-01-02]: ").strip()
+    end = input("  End Date (YYYY-MM-DD) [default: 2025-01-10]: ").strip()
 
     if not start:
-        start = "2024-01-02"
+        start = "2025-01-02"
     if not end:
-        end = "2024-01-05"
+        end = "2025-01-10"
 
     try:
         datetime.strptime(start, "%Y-%m-%d")
