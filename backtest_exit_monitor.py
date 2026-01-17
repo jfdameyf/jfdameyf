@@ -65,24 +65,26 @@ DEFAULT_FIXED_PARAMS = {
 }
 
 # Parameter ranges for grid search optimization
+# NOTE: Full grid = 576 combinations (reasonable for multi-day backtests)
+# For longer backtests, use focused optimization or random sampling
 PARAM_GRID = {
-    # Counter absorption: test lower values (current exits too early)
-    'counter_abs_thresh': [3000, 5000, 7000, 10000],
+    # Counter absorption: higher = let winners run longer
+    'counter_abs_thresh': [5000, 8000, 12000],
 
-    # Delta reversal: test more/fewer bars and different thresholds
-    'delta_reversal_bars': [2, 3, 4, 5],
-    'delta_reversal_thresh': [300, 500, 700, 1000],
+    # Delta reversal: bars x threshold
+    'delta_reversal_bars': [3, 5],
+    'delta_reversal_thresh': [500, 800],
 
-    # Failed follow-through: test different time/price combos
-    'failed_followthrough_bars': [4, 6, 8, 10],
-    'failed_followthrough_pts': [1.5, 2.0, 3.0, 4.0],
+    # Failed follow-through: key param - was cutting winners too early
+    'failed_followthrough_bars': [6, 10, 15],
+    'failed_followthrough_pts': [2.0, 4.0, 6.0],
 
-    # Exhaustion: test different decay sensitivity
-    'exhaustion_decay_pct': [0.3, 0.5, 0.7],
-    'exhaustion_min_bars': [3, 4, 5],
+    # Exhaustion: decay sensitivity
+    'exhaustion_decay_pct': [0.4, 0.6],
+    'exhaustion_min_bars': [4],
 
-    # Divergence: test different lookback periods
-    'divergence_bars': [3, 4, 5, 6],
+    # Divergence: lookback period
+    'divergence_bars': [4, 6],
 }
 
 # Fixed exit parameters to test
@@ -330,10 +332,11 @@ class BacktestEngine:
         self.level_absorption: Dict[str, int] = {}  # level_key -> cumulative absorption
         self.level_last_touch: Dict[str, datetime] = {}
 
-        # Context levels
+        # Context levels (loaded per-day)
         self.support_levels: List[float] = []
         self.resistance_levels: List[float] = []
-        self.all_levels: List[float] = []
+        self.context_data: Dict = {}  # Full context file data
+        self.current_date: Optional[str] = None  # Track current trading day
 
         # Bar aggregation for 2-min candles
         self.bar_buffer: List[pd.Series] = []
@@ -346,42 +349,88 @@ class BacktestEngine:
         self.max_drawdown = 0.0
         self.equity_curve: List[float] = []
 
-    def load_levels(self, levels_file: str, context_file: str, current_price: float = 5000):
-        """Load trading levels from files."""
-        # Load from CSV
-        if os.path.exists(levels_file):
-            try:
-                df = pd.read_csv(levels_file)
-                if 'price' in df.columns:
-                    self.all_levels = df['price'].tolist()
-                    # Classify relative to approximate current price
-                    self.support_levels = sorted([p for p in self.all_levels if p < current_price], reverse=True)
-                    self.resistance_levels = sorted([p for p in self.all_levels if p > current_price])
-                    logger.info(f"Loaded {len(self.all_levels)} levels from {levels_file}")
-            except Exception as e:
-                logger.warning(f"Could not load levels file: {e}")
-
-        # Load from context file
+    def load_context_file(self, context_file: str):
+        """Load the full context file for date-based level lookup."""
         if os.path.exists(context_file):
             try:
                 with open(context_file, 'r') as f:
-                    data = json.load(f)
-                    if data:
-                        latest = data[list(data.keys())[-1]]
-                        levels = latest.get('levels', {})
-                        for l in levels.get('raw_sup', []):
-                            if 'price' in l and l['price'] not in self.support_levels:
-                                self.support_levels.append(l['price'])
-                        for l in levels.get('raw_res', []):
-                            if 'price' in l and l['price'] not in self.resistance_levels:
-                                self.resistance_levels.append(l['price'])
-                        self.support_levels = sorted(self.support_levels, reverse=True)
-                        self.resistance_levels = sorted(self.resistance_levels)
-                logger.info(f"Context: {len(self.support_levels)} support, {len(self.resistance_levels)} resistance")
+                    self.context_data = json.load(f)
+                logger.info(f"Loaded context with {len(self.context_data)} dates")
             except Exception as e:
                 logger.warning(f"Could not load context: {e}")
+                self.context_data = {}
 
-        # Initialize absorption tracking for all levels
+    def load_levels_for_date(self, trade_date: str, current_price: float):
+        """
+        Load levels for a specific trading date.
+        Uses the PREVIOUS day's context (what would be known at market open).
+        """
+        # Find the most recent context date before trade_date
+        available_dates = sorted(self.context_data.keys())
+        context_date = None
+
+        for d in reversed(available_dates):
+            if d < trade_date:
+                context_date = d
+                break
+
+        if not context_date:
+            # No prior context available, use earliest if any
+            if available_dates:
+                context_date = available_dates[0]
+            else:
+                return
+
+        # Clear existing levels
+        self.support_levels = []
+        self.resistance_levels = []
+        self.level_absorption = {}
+
+        # Load levels from the context date
+        day_data = self.context_data.get(context_date, {})
+        levels = day_data.get('levels', {})
+
+        for l in levels.get('raw_sup', []):
+            if 'price' in l:
+                self.support_levels.append(l['price'])
+        for l in levels.get('raw_res', []):
+            if 'price' in l:
+                self.resistance_levels.append(l['price'])
+
+        # Sort levels relative to current price
+        self.support_levels = sorted([p for p in self.support_levels if p < current_price + 10], reverse=True)
+        self.resistance_levels = sorted([p for p in self.resistance_levels if p > current_price - 10])
+
+        # Initialize absorption tracking
+        for price in self.support_levels[:15]:  # Only track nearest 15
+            self.level_absorption[f"{price}_SUP"] = 0
+        for price in self.resistance_levels[:15]:
+            self.level_absorption[f"{price}_RES"] = 0
+
+    def load_levels(self, levels_file: str, context_file: str, current_price: float = 5000):
+        """Load trading levels from files (legacy method for compatibility)."""
+        # Load context file for date-based lookups
+        self.load_context_file(context_file)
+
+        # If no context data, fall back to CSV (but limit levels)
+        if not self.context_data and os.path.exists(levels_file):
+            try:
+                df = pd.read_csv(levels_file)
+                if 'price' in df.columns:
+                    all_levels = df['price'].tolist()
+                    # Only use levels near current price (within 50 points)
+                    self.support_levels = sorted(
+                        [p for p in all_levels if current_price - 50 < p < current_price],
+                        reverse=True
+                    )[:15]
+                    self.resistance_levels = sorted(
+                        [p for p in all_levels if current_price < p < current_price + 50]
+                    )[:15]
+                    logger.info(f"Loaded {len(self.support_levels)} sup / {len(self.resistance_levels)} res from CSV (filtered)")
+            except Exception as e:
+                logger.warning(f"Could not load levels file: {e}")
+
+        # Initialize absorption tracking
         for price in self.support_levels:
             self.level_absorption[f"{price}_SUP"] = 0
         for price in self.resistance_levels:
@@ -401,6 +450,12 @@ class BacktestEngine:
 
     def process_bar(self, bar: pd.Series, timestamp: datetime):
         """Process a single 1-minute OHLCV bar."""
+        # Check if date changed - reload levels for new trading day
+        bar_date = timestamp.strftime('%Y-%m-%d')
+        if bar_date != self.current_date and self.context_data:
+            self.current_date = bar_date
+            self.load_levels_for_date(bar_date, bar['close'])
+
         self.bar_buffer.append(bar)
 
         # Aggregate to 2-minute bars
